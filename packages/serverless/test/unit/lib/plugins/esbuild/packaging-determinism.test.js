@@ -1,0 +1,286 @@
+/**
+ * The esbuild packaging path must produce byte-for-byte identical zip
+ * artifacts when the source content is unchanged, even though esbuild rewrites
+ * its output on every build (giving the built files a fresh mtime).
+ *
+ * archiver stamps each entry with the source file's mtime unless a `date` is
+ * pinned. Un-pinned dates make the zip bytes — and therefore the sha256 used by
+ * check-for-changes — differ on every deploy, forcing a needless redeploy of
+ * every function. The legacy (non-esbuild) packaging path pins every entry to
+ * `new Date(0)`; the esbuild path must do the same.
+ *
+ * We assert this by reading the produced archive and checking that every
+ * entry's stored timestamp is pinned to the epoch (DOS-clamped to 1980) rather
+ * than the file's mtime. This is robust regardless of the test runner's clock,
+ * unlike comparing artifact hashes across simulated rebuilds.
+ *
+ * Pinned dates alone are not enough: archiver resolves `zip.file()` calls
+ * through an internal stat queue with concurrency 4, so the order in which
+ * entries land in the archive follows lstat completion order, not call order.
+ * That makes the whole-zip bytes race between identical runs. The suite below
+ * also packages the same unchanged service several times and asserts the
+ * entry order and whole-zip sha256 are identical on every run.
+ */
+
+import { jest } from '@jest/globals'
+import crypto from 'crypto'
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
+import JsZip from 'jszip'
+
+const Esbuild = (await import('../../../../../lib/plugins/esbuild/index.js'))
+  .default
+
+// new Date(0) clamped to the DOS date minimum (1980-01-01 00:00:00). The zip
+// format stores that timestamp without a timezone and jszip decodes it as UTC,
+// so compare the instant itself rather than local-time getters, which read the
+// previous year west of UTC.
+const PINNED_ENTRY_TIME = Date.UTC(1980, 0, 1)
+
+async function entryTimes(artifactPath) {
+  const zip = await JsZip.loadAsync(fs.readFileSync(artifactPath))
+  return Object.values(zip.files).map((entry) => ({
+    name: entry.name,
+    time: entry.date.getTime(),
+  }))
+}
+
+function makeServiceDir() {
+  const serviceDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sls-esbuild-'))
+  const buildDir = path.join(serviceDir, '.serverless', 'build')
+  fs.mkdirSync(path.join(buildDir, 'node_modules', 'dep'), { recursive: true })
+  // A real file inside node_modules so the zip.directory() path is exercised.
+  fs.writeFileSync(
+    path.join(buildDir, 'node_modules', 'dep', 'index.js'),
+    'module.exports = 1\n',
+  )
+  fs.writeFileSync(
+    path.join(buildDir, 'handler.js'),
+    'export const hello = async () => ({ statusCode: 200 })\n',
+  )
+  return serviceDir
+}
+
+function makePlugin(serviceDir) {
+  const serverless = {
+    serviceDir,
+    config: { serviceDir },
+    service: {
+      service: 'my-service',
+      package: { patterns: [] },
+    },
+    pluginManager: { spawn: async () => {} },
+  }
+  return new Esbuild(serverless, {})
+}
+
+const functions = { hello: { handler: 'handler.hello' } }
+
+describe('esbuild packaging determinism', () => {
+  jest.setTimeout(30_000)
+
+  test('_packageAll pins every zip entry date to the epoch', async () => {
+    const serviceDir = makeServiceDir()
+    const plugin = makePlugin(serviceDir)
+
+    await plugin._packageAll(functions)
+
+    const entries = await entryTimes(
+      path.join(serviceDir, '.serverless', 'my-service.zip'),
+    )
+    expect(entries.length).toBeGreaterThan(0)
+    for (const entry of entries) {
+      expect(entry.time).toBe(PINNED_ENTRY_TIME)
+    }
+  })
+
+  // Many small files racing through archiver's stat queue make ordering
+  // nondeterminism show up reliably when present.
+  function makeRacyServiceDir() {
+    const serviceDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sls-esbuild-'))
+    const buildDir = path.join(serviceDir, '.serverless', 'build')
+    // Several packages with nested files so node_modules ordering itself is
+    // exercised, not just the position of a single entry.
+    for (const dep of ['dep-a', 'dep-b', 'dep-c']) {
+      const depDir = path.join(buildDir, 'node_modules', dep)
+      fs.mkdirSync(path.join(depDir, 'lib'), { recursive: true })
+      fs.writeFileSync(path.join(depDir, 'package.json'), `{"name":"${dep}"}\n`)
+      fs.writeFileSync(path.join(depDir, 'index.js'), 'module.exports = 1\n')
+      fs.writeFileSync(
+        path.join(depDir, 'lib', 'util.js'),
+        'module.exports = 2\n',
+      )
+    }
+    fs.writeFileSync(path.join(buildDir, 'package.json'), '{"name":"svc"}\n')
+    fs.writeFileSync(path.join(buildDir, 'package-lock.json'), '{}\n')
+    fs.writeFileSync(path.join(buildDir, 'yarn.lock'), '# lock\n')
+    fs.writeFileSync(
+      path.join(buildDir, 'pnpm-lock.yaml'),
+      'lockfileVersion: 9\n',
+    )
+    fs.mkdirSync(path.join(buildDir, 'src'), { recursive: true })
+    const racyFunctions = {}
+    for (let i = 0; i < 6; i++) {
+      fs.writeFileSync(
+        path.join(buildDir, 'src', `fn${i}.js`),
+        `export const handler = async () => ({ statusCode: 20${i} })\n`,
+      )
+      fs.writeFileSync(
+        path.join(buildDir, 'src', `fn${i}.js.map`),
+        `{"version":3,"file":"fn${i}.js"}\n`,
+      )
+      racyFunctions[`fn${i}`] = { handler: `src/fn${i}.handler` }
+    }
+    fs.writeFileSync(path.join(serviceDir, 'static-a.txt'), 'a\n')
+    fs.writeFileSync(path.join(serviceDir, 'static-b.txt'), 'b\n')
+    return { serviceDir, racyFunctions }
+  }
+
+  async function zipFingerprint(artifactPath) {
+    const bytes = fs.readFileSync(artifactPath)
+    const zip = await JsZip.loadAsync(bytes)
+    return {
+      hash: crypto.createHash('sha256').update(bytes).digest('hex'),
+      order: Object.values(zip.files).map((entry) => entry.name),
+    }
+  }
+
+  test('_packageAll produces byte-identical zips across repeated runs', async () => {
+    const { serviceDir, racyFunctions } = makeRacyServiceDir()
+    const plugin = makePlugin(serviceDir)
+    plugin.serverless.service.package.patterns = ['static-*.txt']
+
+    const fingerprints = []
+    for (let run = 0; run < 6; run++) {
+      await plugin._packageAll(racyFunctions)
+      fingerprints.push(
+        await zipFingerprint(
+          path.join(serviceDir, '.serverless', 'my-service.zip'),
+        ),
+      )
+    }
+
+    for (const fingerprint of fingerprints.slice(1)) {
+      expect(fingerprint.order).toEqual(fingerprints[0].order)
+      expect(fingerprint.hash).toBe(fingerprints[0].hash)
+    }
+  })
+
+  test('individual packaging produces byte-identical zips across repeated runs', async () => {
+    const { serviceDir, racyFunctions } = makeRacyServiceDir()
+    const plugin = makePlugin(serviceDir)
+    plugin.serverless.service.package.individually = true
+    plugin.serverless.service.package.patterns = ['static-*.txt']
+    plugin.functions = async () => racyFunctions
+    plugin._buildProperties = async () => ({})
+
+    const fingerprints = []
+    for (let run = 0; run < 6; run++) {
+      await plugin._package()
+      fingerprints.push(
+        await zipFingerprint(
+          path.join(serviceDir, '.serverless', 'my-service-fn0.zip'),
+        ),
+      )
+    }
+
+    for (const fingerprint of fingerprints.slice(1)) {
+      expect(fingerprint.order).toEqual(fingerprints[0].order)
+      expect(fingerprint.hash).toBe(fingerprints[0].hash)
+    }
+  })
+
+  test('individual packaging pins every zip entry date to the epoch', async () => {
+    const serviceDir = makeServiceDir()
+    const plugin = makePlugin(serviceDir)
+    plugin.serverless.service.package.individually = true
+    // Bypass build/introspection so the test targets the zipping logic only.
+    plugin.functions = async () => functions
+    plugin._buildProperties = async () => ({})
+
+    await plugin._package()
+
+    const entries = await entryTimes(
+      path.join(serviceDir, '.serverless', 'my-service-hello.zip'),
+    )
+    expect(entries.length).toBeGreaterThan(0)
+    for (const entry of entries) {
+      expect(entry.time).toBe(PINNED_ENTRY_TIME)
+    }
+  })
+})
+
+/**
+ * Packaging now ships the whole build directory instead of a handpicked list
+ * of files. For the overwhelmingly common service — `bundle: true`, no
+ * patterns — the build directory holds exactly what that list named, so the
+ * artifact must come out with the same contents it always had.
+ */
+describe('bundle: true artifact contents are unchanged', () => {
+  jest.setTimeout(30_000)
+
+  // The exact shape a bundling build leaves behind: the pruned package.json,
+  // the lockfile copied beside it, one bundle per handler with its sourcemap,
+  // and the dependencies installed from that package.json.
+  function makeBundledBuildDir() {
+    const serviceDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sls-esbuild-'))
+    const buildDir = path.join(serviceDir, '.serverless', 'build')
+    fs.mkdirSync(path.join(buildDir, 'node_modules', 'dep'), {
+      recursive: true,
+    })
+    fs.writeFileSync(
+      path.join(buildDir, 'node_modules', 'dep', 'index.js'),
+      'module.exports = 1\n',
+    )
+    fs.writeFileSync(path.join(buildDir, 'package.json'), '{"name":"svc"}\n')
+    fs.writeFileSync(path.join(buildDir, 'package-lock.json'), '{}\n')
+    fs.writeFileSync(
+      path.join(buildDir, 'handler.js'),
+      'export const hello = async () => ({ statusCode: 200 })\n',
+    )
+    fs.writeFileSync(path.join(buildDir, 'handler.js.map'), '{}\n')
+    return serviceDir
+  }
+
+  test('_packageAll ships exactly the files the handpicked list named, sorted', async () => {
+    const serviceDir = makeBundledBuildDir()
+    const plugin = makePlugin(serviceDir)
+    plugin.builtArtifacts = new Map([
+      ['hello', { outfile: 'handler.js', mapfile: 'handler.js.map' }],
+    ])
+
+    await plugin._packageAll(functions)
+
+    const zip = await JsZip.loadAsync(
+      fs.readFileSync(path.join(serviceDir, '.serverless', 'my-service.zip')),
+    )
+    const names = Object.keys(zip.files)
+    const fromBuildDir = names.filter((n) => !n.startsWith('node_modules'))
+    expect(fromBuildDir).toEqual([
+      'handler.js',
+      'handler.js.map',
+      'package-lock.json',
+      'package.json',
+    ])
+    expect(names).toContain('node_modules/dep/index.js')
+  })
+
+  test('rebuilding identical content produces byte-identical archives', async () => {
+    const hash = async () => {
+      const serviceDir = makeBundledBuildDir()
+      const plugin = makePlugin(serviceDir)
+      await plugin._packageAll(functions)
+      return crypto
+        .createHash('sha256')
+        .update(
+          fs.readFileSync(
+            path.join(serviceDir, '.serverless', 'my-service.zip'),
+          ),
+        )
+        .digest('hex')
+    }
+
+    expect(await hash()).toBe(await hash())
+  })
+})

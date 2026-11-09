@@ -1,0 +1,627 @@
+import path from 'path'
+import { existsSync } from 'fs'
+import fsp from 'fs/promises'
+import { globby } from 'globby'
+import _ from 'lodash'
+import micromatch from 'micromatch'
+import ServerlessError from '../../../serverless-error.js'
+import parseS3URI from '../../aws/utils/parse-s3-uri.js'
+import { log } from '@serverless/util'
+import { AGENT_SKILL_EXCLUDES } from './agent-skill-excludes.js'
+import { BOOTSTRAP_FILE, WEB_APPS_DIR } from '../../aws/web-apps/constants.js'
+import { getWebAppsConfig } from '../../aws/lib/web-apps.js'
+import {
+  generateBootstrap,
+  getEntryFormat,
+  normalizeEntryPath,
+} from '../../aws/web-apps/packaging/bootstrap.js'
+
+/**
+ * Configuration file extensions the framework knows how to parse.
+ * Kept in sync with `lib/configuration/read.js`.
+ */
+const SERVERLESS_CONFIG_EXTENSIONS = [
+  'yml',
+  'yaml',
+  'json',
+  'toml',
+  'ts',
+  'cjs',
+  'mjs',
+  'js',
+]
+
+/**
+ * Resolve the user's service-configuration filename(s) for exclusion from
+ * the deployable artifact.
+ *
+ * Honors custom config filenames (e.g., `my-service.yml`) by using
+ * `serverless.configurationFilename` as the base.
+ *
+ * When `configurationFilename` does not carry a file extension, this helper
+ * probes the service directory for which `<base>.<ext>` files actually exist
+ * and excludes those. If the value already carries an extension, it is used
+ * verbatim.
+ */
+export function resolveServerlessConfigFileExcludes(serverless) {
+  const base = serverless.configurationFilename
+  if (!base) return []
+
+  // Already has an extension — use as-is.
+  if (path.extname(base)) return [base]
+
+  // No extension — probe the filesystem for matching `<base>.<ext>` files.
+  const candidates = SERVERLESS_CONFIG_EXTENSIONS.map((ext) => `${base}.${ext}`)
+  const present = candidates.filter((name) =>
+    existsSync(path.join(serverless.serviceDir, name)),
+  )
+
+  // If nothing matched (unusual — the framework wouldn't have loaded
+  // anything), fall back to excluding the bare name.
+  return present.length > 0 ? present : [base]
+}
+
+/**
+ * Web apps this plugin zips: those without `package.artifact` (shipped as
+ * supplied) that esbuild did not build (`serverless.builtWebApps`, set by the
+ * esbuild plugin before packaging).
+ *
+ * @returns {string[]} web app names
+ */
+export function getWebAppsToPackage(serverless) {
+  const builtWebApps = serverless.builtWebApps || new Set()
+  return Object.entries(getWebAppsConfig(serverless))
+    .filter(
+      ([name, webApp]) => !webApp?.package?.artifact && !builtWebApps.has(name),
+    )
+    .map(([name]) => name)
+}
+
+/** Files no artifact the framework zips ever contains, whatever the config. */
+export const DEFAULT_EXCLUDES = [
+  '.git/**',
+  '.gitignore',
+  '.DS_Store',
+  'npm-debug.log',
+  'yarn-*.log',
+  '.serverless/**',
+  '.serverless_plugins/**',
+  ...AGENT_SKILL_EXCLUDES,
+]
+
+/**
+ * The service-level `package.include` and `package.patterns`, followed by
+ * `include` (an artifact's own patterns).
+ */
+export function getPackageIncludes(serverless, include) {
+  const packageIncludes = [
+    ...(serverless.service.package.include || []),
+    ...(serverless.service.package.patterns || []),
+  ]
+  return _.union(packageIncludes, include)
+}
+
+/**
+ * The exclusions every artifact starts from: `defaults`, the service config
+ * file, the local plugins path, service-level `package.exclude`, layer paths
+ * (with `excludeLayers`), `.env*` under `useDotenv`, then `exclude`.
+ */
+export function getPackageExcludes(
+  serverless,
+  exclude,
+  excludeLayers,
+  defaults = DEFAULT_EXCLUDES,
+) {
+  const packageExcludes = serverless.service.package.exclude || []
+  // add local service plugins Path
+  const pluginsLocalPath = serverless.pluginManager.parsePluginsObject(
+    serverless.service.plugins,
+  ).localPath
+  const localPathExcludes = []
+  if (pluginsLocalPath) {
+    localPathExcludes.push(pluginsLocalPath)
+  }
+  // add layer paths
+  const layerExcludes = excludeLayers
+    ? serverless.service
+        .getAllLayers()
+        .map((layer) => `${serverless.service.getLayer(layer).path}/**`)
+    : []
+  // add defaults for exclude
+
+  const serverlessConfigFileExclude =
+    resolveServerlessConfigFileExcludes(serverless)
+
+  const configurationInput = serverless.configurationInput
+  const envFilesExclude =
+    configurationInput && configurationInput.useDotenv ? ['.env*'] : []
+
+  return _.union(
+    defaults,
+    serverlessConfigFileExclude,
+    localPathExcludes,
+    packageExcludes,
+    layerExcludes,
+    envFilesExclude,
+    exclude,
+  )
+}
+
+export default {
+  defaultExcludes: DEFAULT_EXCLUDES,
+
+  getIncludes(include) {
+    return getPackageIncludes(this.serverless, include)
+  },
+
+  getRuntime(runtime) {
+    const defaultRuntime = 'nodejs20.x'
+    return runtime || this.serverless.service.provider.runtime || defaultRuntime
+  },
+
+  getExcludes(exclude, excludeLayers) {
+    return getPackageExcludes(
+      this.serverless,
+      exclude,
+      excludeLayers,
+      this.defaultExcludes,
+    )
+  },
+
+  async packageService() {
+    let shouldPackageService = false
+    let shownFuncPackageWarning = false
+    const allFunctions = this.serverless.service.getAllFunctions()
+    let packagePromises = allFunctions.map(async (functionName) => {
+      const functionObject = this.serverless.service.getFunction(functionName)
+      if (functionObject.image) return
+      functionObject.package = functionObject.package || {}
+      if (functionObject.package.disable) {
+        log.info(`Packaging disabled for function: "${functionName}"`)
+        return
+      }
+      if (functionObject.package.artifact) {
+        if (parseS3URI(functionObject.package.artifact)) return
+        try {
+          await fsp.access(
+            path.resolve(
+              this.serverless.serviceDir,
+              functionObject.package.artifact,
+            ),
+          )
+          return
+        } catch (error) {
+          throw new ServerlessError(
+            'Cannot access package artifact at ' +
+              `"${functionObject.package.artifact}" (for "${functionName}"): ${error.message}`,
+            'INVALID_PACKAGE_ARTIFACT_PATH',
+          )
+        }
+      }
+      if (
+        functionObject.package.individually ||
+        this.serverless.service.package.individually
+      ) {
+        await this.packageFunction(functionName)
+        return
+      }
+
+      // show warning if package patterns in function are provided
+      // without package.individually set to true at service level or function level.
+      if (functionObject.package.patterns && !shownFuncPackageWarning) {
+        shownFuncPackageWarning = true
+        log.warning()
+        const warningMessage = [
+          'Package patterns at function level are only applicable ',
+          'if package.individually is set to true at service level or function level in serverless.yaml.',
+          ' The framework will ignore the patterns defined at the function level and apply only the service-wide ones.',
+        ].join('')
+        log.warning(warningMessage)
+      }
+
+      shouldPackageService = true
+    })
+    const allLayers = this.serverless.service.getAllLayers()
+    packagePromises = packagePromises.concat(
+      allLayers.map(async (layerName) => {
+        const layerObject = this.serverless.service.getLayer(layerName)
+        layerObject.package = layerObject.package || {}
+        if (layerObject.package.artifact) return
+        await this.packageLayer(layerName)
+      }),
+    )
+
+    // Package agents that need code deployment
+    const agentsToPackage = this.getAgentsToPackage()
+    packagePromises = packagePromises.concat(
+      agentsToPackage.map(async ({ name, config }) => {
+        config.package = config.package || {}
+        if (config.package.artifact) return
+        log.info(`Packaging agent "${name}"`)
+        await this.packageAgent(name)
+      }),
+    )
+
+    packagePromises = packagePromises.concat(
+      getWebAppsToPackage(this.serverless).map(async (name) => {
+        log.info(`Packaging web app "${name}"`)
+        await this.packageWebApp(name)
+      }),
+    )
+
+    await Promise.all(packagePromises)
+    if (shouldPackageService) {
+      if (this.serverless.service.package.artifact) {
+        if (parseS3URI(this.serverless.service.package.artifact)) return
+        try {
+          await fsp.access(
+            path.resolve(
+              this.serverless.serviceDir,
+              this.serverless.service.package.artifact,
+            ),
+          )
+          return
+        } catch (error) {
+          throw new ServerlessError(
+            'Cannot access package artifact at ' +
+              `"${this.serverless.service.package.artifact}": ${error.message}`,
+            'INVALID_PACKAGE_ARTIFACT_PATH',
+          )
+        }
+      }
+      await this.packageAll()
+    }
+  },
+
+  async packageAll() {
+    const zipFileName = `${this.serverless.service.service}.zip`
+
+    return this.resolveFilePathsAll().then((filePaths) =>
+      this.zipFiles(filePaths, zipFileName).then((filePath) => {
+        // only set the default artifact for backward-compatibility
+        // when no explicit artifact is defined
+        if (!this.serverless.service.package.artifact) {
+          this.serverless.service.package.artifact = filePath
+          this.serverless.service.artifact = filePath
+        }
+        return filePath
+      }),
+    )
+  },
+
+  async packageFunction(functionName) {
+    const functionObject = this.serverless.service.getFunction(functionName)
+    if (functionObject.image) return null
+
+    const funcPackageConfig = functionObject.package || {}
+
+    // use the artifact in function config if provided
+    if (funcPackageConfig.artifact) {
+      const filePath = path.resolve(
+        this.serverless.serviceDir,
+        funcPackageConfig.artifact,
+      )
+      functionObject.package.artifact = filePath
+      return filePath
+    }
+
+    // use the artifact in service config if provided
+    // and if the function is not set to be packaged individually
+    if (
+      this.serverless.service.package.artifact &&
+      !funcPackageConfig.individually
+    ) {
+      const filePath = path.resolve(
+        this.serverless.serviceDir,
+        this.serverless.service.package.artifact,
+      )
+      funcPackageConfig.artifact = filePath
+
+      return filePath
+    }
+
+    const zipFileName = `${functionName}.zip`
+
+    const filePaths = await this.resolveFilePathsFunction(functionName)
+    const artifactPath = await this.zipFiles(filePaths, zipFileName)
+    funcPackageConfig.artifact = path.relative(
+      this.serverless.serviceDir,
+      artifactPath,
+    )
+    return artifactPath
+  },
+
+  async packageLayer(layerName) {
+    const layerObject = this.serverless.service.getLayer(layerName)
+
+    const zipFileName = `${layerName}.zip`
+
+    return this.resolveFilePathsLayer(layerName)
+      .then((filePaths) =>
+        filePaths.map((f) =>
+          path.resolve(
+            this.serverless.serviceDir,
+            path.join(layerObject.path, f),
+          ),
+        ),
+      )
+      .then((filePaths) =>
+        this.zipFiles(
+          filePaths,
+          zipFileName,
+          path.resolve(this.serverless.serviceDir, layerObject.path),
+        ).then((artifactPath) => {
+          layerObject.package = {
+            artifact: artifactPath,
+          }
+          return artifactPath
+        }),
+      )
+  },
+
+  /**
+   * Get all agents that need code packaging (have handler, no artifact.image/s3.bucket)
+   */
+  getAgentsToPackage() {
+    const aiConfig =
+      this.serverless.service.ai || this.serverless.configurationInput?.ai || {}
+    const agents = aiConfig.agents || {}
+
+    return Object.entries(agents)
+      .filter(([, config]) => {
+        // Only runtime agents (type defaults to 'runtime' if not specified)
+        const agentType = config.type || 'runtime'
+        if (agentType !== 'runtime') return false
+
+        const artifact = config.artifact || {}
+
+        // Skip if using container image (string or object with build config)
+        if (artifact.image) return false
+
+        // Skip if user specified their own S3 bucket (manual management)
+        if (artifact.s3?.bucket) return false
+
+        // Need handler for code deployment (new schema)
+        if (!config.handler) return false
+
+        return true
+      })
+      .map(([name, config]) => ({ name, config }))
+  },
+
+  /**
+   * Package an agent for code deployment
+   */
+  async packageAgent(agentName) {
+    const aiConfig =
+      this.serverless.service.ai || this.serverless.configurationInput?.ai || {}
+    const agentConfig = (aiConfig.agents || {})[agentName]
+
+    if (!agentConfig) return null
+
+    const agentPackageConfig = agentConfig.package || {}
+
+    // Use the artifact in agent config if provided (pre-packaged)
+    if (agentPackageConfig.artifact) {
+      const filePath = path.resolve(
+        this.serverless.serviceDir,
+        agentPackageConfig.artifact,
+      )
+      agentConfig.package = agentConfig.package || {}
+      agentConfig.package.artifact = filePath
+      return filePath
+    }
+
+    const zipFileName = `agent-${agentName}.zip`
+
+    const filePaths = await this.resolveFilePathsAgent(agentName)
+    const artifactPath = await this.zipFiles(filePaths, zipFileName)
+
+    agentConfig.package = agentConfig.package || {}
+    agentConfig.package.artifact = path.relative(
+      this.serverless.serviceDir,
+      artifactPath,
+    )
+
+    return artifactPath
+  },
+
+  async resolveFilePathsAgent(agentName) {
+    const aiConfig =
+      this.serverless.service.ai || this.serverless.configurationInput?.ai || {}
+    const agentConfig = (aiConfig.agents || {})[agentName]
+    const agentPackageConfig = agentConfig?.package || {}
+
+    // Agent-specific exclusions (Python cache files)
+    const agentExcludes = [
+      '**/__pycache__/**',
+      '**/*.pyc',
+      '**/*.pyo',
+      '**/.pytest_cache/**',
+      '**/*.egg-info/**',
+    ]
+
+    return this.resolveFilePathsFromPatterns(
+      await this.excludeDevDependencies({
+        exclude: this.getExcludes(
+          [...agentExcludes, ...(agentPackageConfig.exclude || [])],
+          true,
+        ),
+        include: this.getIncludes([
+          ...(agentPackageConfig.include || []),
+          ...(agentPackageConfig.patterns || []),
+        ]),
+        contextName: `agent "${agentName}"`,
+      }),
+    )
+  },
+
+  /**
+   * Zip a web app that esbuild does not build: the service directory, selected
+   * by the service's and then the web app's package patterns, plus the
+   * generated bootstrap that starts `entry`. Written to
+   * `.serverless/webapps/<name>.zip`, which moves with the other artifacts to
+   * the package directory.
+   */
+  async packageWebApp(name) {
+    const webApp = getWebAppsConfig(this.serverless)[name]
+    const packageConfig = webApp.package || {}
+
+    const filePaths = await this.resolveFilePathsFromPatterns(
+      await this.excludeDevDependencies({
+        exclude: this.getExcludes([], true),
+        include: this.getIncludes(packageConfig.patterns || []),
+        contextName: `web app "${name}"`,
+      }),
+    )
+
+    const entryPath = normalizeEntryPath(webApp.entry)
+    if (
+      !filePaths.some((filePath) => filePath.replace(/\\/g, '/') === entryPath)
+    ) {
+      throw new ServerlessError(
+        `webApps.${name}.entry "${webApp.entry}" is not among the files packaged for this web app. Check the path and package.patterns.`,
+        'WEB_APPS_ENTRY_NOT_FOUND',
+        { stack: false },
+      )
+    }
+
+    return this.zipFiles(
+      filePaths,
+      path.join(WEB_APPS_DIR, `${name}.zip`),
+      undefined,
+      {
+        generatedEntries: [
+          {
+            name: BOOTSTRAP_FILE,
+            content: generateBootstrap({
+              entryPath,
+              entryFormat: getEntryFormat(
+                this.serverless.serviceDir,
+                entryPath,
+              ),
+              enableSourceMaps: false,
+            }),
+          },
+        ],
+      },
+    )
+  },
+
+  async resolveFilePathsAll() {
+    return this.resolveFilePathsFromPatterns(
+      await this.excludeDevDependencies({
+        exclude: this.getExcludes([], true),
+        include: this.getIncludes(),
+        contextName: 'service package',
+      }),
+    )
+  },
+
+  async resolveFilePathsFunction(functionName) {
+    const functionObject = this.serverless.service.getFunction(functionName)
+    const funcPackageConfig = functionObject.package || {}
+
+    return this.resolveFilePathsFromPatterns(
+      await this.excludeDevDependencies({
+        exclude: this.getExcludes(funcPackageConfig.exclude, true),
+        include: this.getIncludes([
+          ...(funcPackageConfig.include || []),
+          ...(funcPackageConfig.patterns || []),
+        ]),
+        contextName: `function "${functionName}"`,
+      }),
+    )
+  },
+
+  async resolveFilePathsLayer(layerName) {
+    const layerObject = this.serverless.service.getLayer(layerName)
+    const layerPackageConfig = layerObject.package || {}
+    const params = {
+      exclude: this.getExcludes(layerPackageConfig.exclude, false),
+      include: this.getIncludes([
+        ...(layerPackageConfig.include || []),
+        ...(layerPackageConfig.patterns || []),
+      ]),
+      contextName: `layer "${layerName}"`,
+    }
+
+    // Dev dependency globs are relative to the service directory, while layer
+    // files are matched relative to the layer path. Applied to any other
+    // directory, they would exclude same-named packages of the layer itself.
+    const isServiceDirLayer =
+      path.resolve(this.serverless.serviceDir, layerObject.path) ===
+      path.resolve(this.serverless.serviceDir)
+
+    return this.resolveFilePathsFromPatterns(
+      isServiceDirLayer ? await this.excludeDevDependencies(params) : params,
+      layerObject.path,
+    )
+  },
+
+  async resolveFilePathsFromPatterns(params, prefix) {
+    const patterns = []
+    const devDependencyExcludeSet = params.devDependencyExcludeSet || new Set()
+
+    params.exclude.forEach((pattern) => {
+      // Ensure to apply dev dependency exclusion as last
+      if (devDependencyExcludeSet.has(pattern)) return
+      if (pattern.charAt(0) !== '!') {
+        patterns.push(`!${pattern}`)
+      } else {
+        patterns.push(pattern.substring(1))
+      }
+    })
+
+    // push the include globs to the end of the array
+    // (files and folders will be re-added again even if they were excluded beforehand)
+    params.include.forEach((pattern) => {
+      patterns.push(pattern)
+    })
+
+    for (const pattern of devDependencyExcludeSet) {
+      if (pattern.charAt(0) !== '!') {
+        patterns.push(`!${pattern}`)
+      } else {
+        patterns.push(pattern.substring(1))
+      }
+    }
+
+    // NOTE: please keep this order of concatenating the include params
+    // rather than doing it the other way round!
+    // see https://github.com/serverless/serverless/pull/5825 for more information
+    return globby(['**'].concat(params.include), {
+      cwd: path.join(this.serverless.serviceDir, prefix || ''),
+      dot: true,
+      silent: true,
+      follow: true,
+      nodir: true,
+      expandDirectories: false,
+    }).then((allFilePaths) => {
+      const filePathStates = allFilePaths.reduce(
+        (p, c) => Object.assign(p, { [c]: true }),
+        {},
+      )
+      patterns
+        // micromatch only does / style path delimiters, so convert them if on windows
+        .map((p) => {
+          return process.platform === 'win32' ? p.replace(/\\/g, '/') : p
+        })
+        .forEach((p) => {
+          const exclude = p.startsWith('!')
+          const pattern = exclude ? p.slice(1) : p
+          micromatch(allFilePaths, [pattern], { dot: true }).forEach((key) => {
+            filePathStates[key] = !exclude
+          })
+        })
+      const filePaths = Object.entries(filePathStates)
+        .filter((r) => r[1] === true)
+        .map((r) => r[0])
+      if (filePaths.length !== 0) return filePaths
+      throw new ServerlessError(
+        'No file matches include / exclude patterns',
+        'NO_MATCHED_FILES',
+      )
+    })
+  },
+}

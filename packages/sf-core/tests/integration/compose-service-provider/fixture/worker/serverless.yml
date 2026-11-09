@@ -1,0 +1,10 @@
+service: svcprovider-worker
+provider:
+  name: aws
+resources:
+  Resources:
+    JobsQueue:
+      Type: AWS::SQS::Queue
+  Outputs:
+    JobsQueueUrl:
+      Value: !Ref JobsQueue

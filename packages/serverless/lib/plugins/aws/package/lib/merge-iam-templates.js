@@ -1,0 +1,364 @@
+import _ from 'lodash'
+import path from 'path'
+import { ServerlessError, ServerlessErrorCodes } from '@serverless/util'
+import buildFunctionLogGroupResources from './function-log-groups.js'
+import usesDedicatedPerFunctionRole from './uses-dedicated-per-function-role.js'
+import { getWebAppsConfig } from '../../lib/web-apps.js'
+import { getWebAppFunctionName } from '../../web-apps/compilers/function.js'
+import {
+  getWebAppKmsStatement,
+  grantWebAppLogGroups,
+} from '../../web-apps/iam.js'
+
+export default {
+  mergeIamTemplates() {
+    const webApps = getWebAppsConfig(this.serverless)
+    const hasFunctions = this.serverless.service.getAllFunctions().length > 0
+
+    // resolve early if no functions or web apps are provided
+    if (!hasFunctions && !Object.keys(webApps).length) {
+      return
+    }
+
+    // create log group resources
+    this.serverless.service.getAllFunctions().forEach((functionName) => {
+      const functionObject = this.serverless.service.getFunction(functionName)
+      const logGroupResources = buildFunctionLogGroupResources({
+        functionName,
+        functionObject,
+        awsProvider: this.provider,
+        serviceProvider: this.serverless.service.provider,
+      })
+      _.merge(
+        this.serverless.service.provider.compiledCloudFormationTemplate
+          .Resources,
+        logGroupResources,
+      )
+    })
+
+    const iamConfig = this.serverless.service.provider.iam || {}
+    const iamRole = _.get(iamConfig, 'role', {})
+
+    // resolve early if provider level role is provided as a reference to existing role
+    if (this.provider.isExistingRoleProvided(iamRole)) {
+      return
+    }
+
+    const perFunctionIamRoleEnabled =
+      _.isObject(iamRole) && iamRole.mode === 'perFunction'
+
+    if ('role' in this.serverless.service.provider) {
+      if (perFunctionIamRoleEnabled) {
+        throw new ServerlessError(
+          "Explicit service-wide IAM role (provider.role) cannot be combined with per-function IAM mode (provider.iam.role.mode: 'perFunction')",
+          ServerlessErrorCodes.general.INVALID_CONFIG,
+          {
+            stack: false,
+          },
+        )
+      }
+      return
+    }
+
+    // resolve early if all functions and web apps contain a custom role
+    const customRoleProvided =
+      this.serverless.service.getAllFunctions().every((functionName) => {
+        const functionObject = this.serverless.service.getFunction(functionName)
+        return 'role' in functionObject
+      }) && Object.values(webApps).every((webApp) => webApp.role)
+
+    if (customRoleProvided) {
+      return
+    }
+
+    if (perFunctionIamRoleEnabled) {
+      return
+    }
+
+    // merge in the iamRoleLambdaTemplate
+    const iamRoleLambdaExecutionTemplate = this.serverless.utils.readFileSync(
+      path.join(
+        this.serverless.config.serverlessPath,
+        'plugins',
+        'aws',
+        'package',
+        'lib',
+        'iam-role-lambda-execution-template.json',
+      ),
+    )
+    iamRoleLambdaExecutionTemplate.Properties.Path =
+      this.provider.naming.getRolePath()
+    iamRoleLambdaExecutionTemplate.Properties.RoleName =
+      this.provider.naming.getRoleName()
+
+    // set role tags
+    if (iamRole.tags) {
+      iamRoleLambdaExecutionTemplate.Properties.Tags = Object.keys(
+        iamRole.tags,
+      ).map((key) => ({
+        Key: key,
+        Value: iamRole.tags[key],
+      }))
+    }
+
+    // set permission boundary
+    if (iamRole.permissionsBoundary) {
+      iamRoleLambdaExecutionTemplate.Properties.PermissionsBoundary =
+        iamRole.permissionsBoundary
+    } else if (iamRole.permissionBoundary) {
+      iamRoleLambdaExecutionTemplate.Properties.PermissionsBoundary =
+        iamRole.permissionBoundary
+    } else if (this.serverless.service.provider.rolePermissionsBoundary) {
+      iamRoleLambdaExecutionTemplate.Properties.PermissionsBoundary =
+        this.serverless.service.provider.rolePermissionsBoundary
+    }
+
+    iamRoleLambdaExecutionTemplate.Properties.Policies[0].PolicyName =
+      this.provider.naming.getPolicyName()
+
+    _.merge(
+      this.serverless.service.provider.compiledCloudFormationTemplate.Resources,
+      {
+        [this.provider.naming.getRoleLogicalId()]:
+          iamRoleLambdaExecutionTemplate,
+      },
+    )
+
+    const canonicalFunctionNamePrefix = `${
+      this.provider.serverless.service.service
+    }-${this.provider.getStage()}`
+    const logGroupsPrefix = this.provider.naming.getLogGroupName(
+      canonicalFunctionNamePrefix,
+    )
+
+    const policyDocumentStatements =
+      this.serverless.service.provider.compiledCloudFormationTemplate.Resources[
+        this.provider.naming.getRoleLogicalId()
+      ].Properties.Policies[0].PolicyDocument.Statement
+
+    // Emits a Deny statement blocking logs:PutLogEvents for the given
+    // (canonically named, disableLogs) functions' log groups.
+    const emitDisableLogsDeny = (functionNames) => {
+      const arnOfDisableLogGroups = functionNames.map((functionName) => {
+        return {
+          'Fn::Sub':
+            'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}' +
+            `:log-group:${this.provider.naming.getLogGroupName(
+              functionName,
+            )}:*`,
+        }
+      })
+      this.mergeStatements([
+        {
+          Effect: 'Deny',
+          Action: 'logs:PutLogEvents',
+          Resource: arnOfDisableLogGroups,
+        },
+      ])
+    }
+
+    let hasOneOrMoreCanonicallyNamedFunctions = false
+    const disableLogsCanonicallyNamedFunctions = []
+    const allowedLogGroups = []
+    let skippedDedicatedLogContributions = false
+
+    // Ensure policies for functions with custom name resolution
+    this.serverless.service.getAllFunctions().forEach((functionName) => {
+      const functionObject = this.serverless.service.getFunction(functionName)
+      const {
+        name: resolvedFunctionName,
+        disableLogs: areLogsDisabled,
+        logs: { logGroup: customLogGroupName } = {},
+      } = functionObject
+      const isDefaultLogGroupName =
+        (!resolvedFunctionName ||
+          resolvedFunctionName.startsWith(canonicalFunctionNamePrefix)) &&
+        !customLogGroupName
+      if (isDefaultLogGroupName) {
+        if (areLogsDisabled) {
+          disableLogsCanonicallyNamedFunctions.push(resolvedFunctionName)
+        } else {
+          hasOneOrMoreCanonicallyNamedFunctions = true
+        }
+        return
+      }
+
+      if (!areLogsDisabled && !allowedLogGroups.includes(customLogGroupName)) {
+        const skipGlobalRolePermissions = usesDedicatedPerFunctionRole({
+          functionObject,
+          serverless: this.serverless,
+          awsProvider: this.provider,
+        })
+
+        if (!skipGlobalRolePermissions) {
+          const customFunctionNamelogGroupsPrefix =
+            customLogGroupName ??
+            this.provider.naming.getLogGroupName(resolvedFunctionName, {
+              logGroupClass: this.provider.getLogGroupClass(functionObject),
+            })
+
+          policyDocumentStatements[0].Resource.push({
+            'Fn::Sub':
+              'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}' +
+              `:log-group:${customFunctionNamelogGroupsPrefix}:*`,
+          })
+
+          policyDocumentStatements[1].Resource.push({
+            'Fn::Sub':
+              'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}' +
+              `:log-group:${customFunctionNamelogGroupsPrefix}:*:*`,
+          })
+          allowedLogGroups.push(customFunctionNamelogGroupsPrefix)
+        } else {
+          skippedDedicatedLogContributions = true
+        }
+      }
+    })
+
+    // Web apps on the shared role log to /aws/lambda/web/<name>, which the
+    // canonical function wildcard does not cover. A web app with `role` or a
+    // dedicated role (`iam.role`) gets these grants on that role instead.
+    const webAppCtx = {
+      serviceName: this.serverless.service.service,
+      stage: this.provider.getStage(),
+    }
+    for (const [key, webApp] of Object.entries(webApps)) {
+      if (webApp.role) continue
+      if (
+        usesDedicatedPerFunctionRole({
+          functionObject: webApp,
+          serverless: this.serverless,
+          awsProvider: this.provider,
+        })
+      ) {
+        skippedDedicatedLogContributions = true
+        continue
+      }
+      grantWebAppLogGroups(
+        policyDocumentStatements,
+        getWebAppFunctionName(webAppCtx, key, webApp),
+      )
+      const kmsStatement = getWebAppKmsStatement(
+        webApp,
+        this.serverless.service.provider,
+      )
+      if (
+        kmsStatement &&
+        !policyDocumentStatements.some((s) => _.isEqual(s, kmsStatement))
+      ) {
+        this.mergeStatements([kmsStatement])
+      }
+    }
+
+    if (hasOneOrMoreCanonicallyNamedFunctions) {
+      // Ensure general policies for functions with default name resolution
+      policyDocumentStatements[0].Resource.push({
+        'Fn::Sub':
+          'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}' +
+          `:log-group:${logGroupsPrefix}*:*`,
+      })
+
+      policyDocumentStatements[1].Resource.push({
+        'Fn::Sub':
+          'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}' +
+          `:log-group:${logGroupsPrefix}*:*:*`,
+      })
+      if (disableLogsCanonicallyNamedFunctions.length > 0) {
+        // add deny rule for disabled logs function
+        emitDisableLogsDeny(disableLogsCanonicallyNamedFunctions)
+      }
+    }
+
+    if (
+      skippedDedicatedLogContributions &&
+      policyDocumentStatements[0].Resource.length === 0 &&
+      policyDocumentStatements[1].Resource.length === 0
+    ) {
+      // All log-contributing functions have dedicated roles; keep the shared
+      // role's log statements valid (IAM rejects empty Resource arrays).
+      policyDocumentStatements[0].Resource.push({
+        'Fn::Sub':
+          'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}' +
+          `:log-group:${logGroupsPrefix}*:*`,
+      })
+      policyDocumentStatements[1].Resource.push({
+        'Fn::Sub':
+          'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}' +
+          `:log-group:${logGroupsPrefix}*:*:*`,
+      })
+      if (disableLogsCanonicallyNamedFunctions.length > 0) {
+        // The wildcard Allow above covers every canonical log group,
+        // including those of disableLogs functions (their Deny was skipped
+        // above because hasOneOrMoreCanonicallyNamedFunctions was false).
+        // Emit the Deny here too, or disableLogs would be silently ignored.
+        emitDisableLogsDeny(disableLogsCanonicallyNamedFunctions)
+      }
+    }
+
+    // add custom iam role statements
+    if (iamRole.statements) {
+      this.mergeStatements(iamRole.statements)
+    } else if (this.serverless.service.provider.iamRoleStatements) {
+      this.mergeStatements(this.serverless.service.provider.iamRoleStatements)
+    }
+
+    // add iam managed policies
+    if (iamRole.managedPolicies) {
+      this.mergeManagedPolicies(iamRole.managedPolicies)
+    } else if (this.serverless.service.provider.iamManagedPolicies) {
+      this.mergeManagedPolicies(
+        this.serverless.service.provider.iamManagedPolicies,
+      )
+    }
+
+    // check if one of the functions contains vpc configuration
+    const vpcConfigProvided = this.serverless.service
+      .getAllFunctions()
+      .some((functionName) => {
+        const functionObject = this.serverless.service.getFunction(functionName)
+        return 'vpc' in functionObject
+      })
+
+    // Web apps never need it: their network connector, not the function,
+    // creates the network interfaces.
+    if (
+      vpcConfigProvided ||
+      (this.serverless.service.provider.vpc && hasFunctions)
+    ) {
+      // add managed iam policy to allow ENI management
+      this.mergeManagedPolicies([
+        {
+          'Fn::Join': [
+            '',
+            [
+              'arn:',
+              { Ref: 'AWS::Partition' },
+              ':iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole',
+            ],
+          ],
+        },
+      ])
+    }
+
+    return
+  },
+
+  mergeManagedPolicies(managedPolicies) {
+    if (!managedPolicies.length) return
+    const resource =
+      this.serverless.service.provider.compiledCloudFormationTemplate.Resources[
+        this.provider.naming.getRoleLogicalId()
+      ].Properties
+    if (!Array.isArray(resource.ManagedPolicyArns)) {
+      resource.ManagedPolicyArns = []
+    }
+
+    resource.ManagedPolicyArns.push(...managedPolicies)
+  },
+
+  mergeStatements(statements) {
+    this.serverless.service.provider.compiledCloudFormationTemplate.Resources[
+      this.provider.naming.getRoleLogicalId()
+    ].Properties.Policies[0].PolicyDocument.Statement.push(...statements)
+  },
+}

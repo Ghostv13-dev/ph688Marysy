@@ -1,0 +1,74 @@
+<!--
+title: Serverless Framework Commands - AWS Lambda - Deploy Function
+description: Deploy your AWS Lambda functions quickly without CloudFormation
+short_title: Commands - Deploy Function
+keywords:
+  [
+    'Serverless',
+    'Framework',
+    'AWS',
+    'Lambda',
+    'Deploy Function',
+    'Serverless AWS Lambda Commands',
+    'AWS Lambda Deployment',
+    'Serverless Framework CLI',
+    'Serverless Deploy Function',
+  ]
+-->
+
+<!-- DOCS-SITE-LINK:START automatically generated  -->
+
+### [Read this on the main serverless docs site](https://www.serverless.com/framework/docs/providers/aws/cli-reference/deploy-function)
+
+<!-- DOCS-SITE-LINK:END -->
+
+# AWS - Deploy Function
+
+The `sls deploy function` command deploys an individual function without AWS CloudFormation. This command simply swaps out the zip file that your CloudFormation stack is pointing toward. This is a much faster way of deploying changes in code.
+
+```bash
+serverless deploy function -f functionName
+```
+
+**Note:** This command **now** deploys both function configuration and code by
+default. Just as before, this puts your function in an inconsistent state that
+is out of sync with your CloudFormation stack. Use this for faster development
+cycles and not production deployments. A later `serverless deploy` does not
+undo a configuration change made this way: CloudFormation changes only what
+differs from the template it deployed last, and when nothing else changed,
+the deploy is skipped. To put the function back, run
+`serverless deploy function` again from the configuration you want. With
+`codeStorageMode: reference`, this command updates the function using
+Lambda-managed storage; the next `serverless deploy` restores reference mode.
+
+`deploy function` deploys functions only. [Web apps](../guide/web-apps.md) deploy with `serverless deploy`; given a web app's name, the command stops with `"<name>" is a web app. Deploy it with serverless deploy.`
+
+## Options
+
+- `--function` or `-f` The name of the function which should be deployed
+- `--stage` or `-s` The stage in your service that you want to deploy to.
+- `--region` or `-r` The region in that stage that you want to deploy to.
+- `--aws-profile` The AWS profile you want to use.
+- `--update-config` or `-u` Pushes ONLY Lambda-level configuration changes e.g. handler, timeout or memorySize
+
+## Examples
+
+### Deployment without stage and region options
+
+```bash
+serverless deploy function --function helloWorld
+```
+
+### Deployment with stage and region options
+
+```bash
+serverless deploy function --function helloWorld \
+  --stage dev \
+  --region us-east-1
+```
+
+### Deploy only configuration changes
+
+```bash
+serverless deploy function --function helloWorld --update-config
+```

@@ -1,0 +1,685 @@
+import {
+  jest,
+  describe,
+  beforeEach,
+  afterEach,
+  it,
+  expect,
+} from '@jest/globals'
+import os from 'os'
+import path from 'path'
+import fs from 'fs'
+import fsp from 'fs/promises'
+import JsZip from 'jszip'
+
+// Mock @serverless/util
+jest.unstable_mockModule('@serverless/util', () => ({
+  log: {
+    debug: jest.fn(),
+    get: jest.fn(() => ({ debug: jest.fn(), warning: jest.fn() })),
+    warning: jest.fn(),
+    notice: jest.fn(),
+    info: jest.fn(),
+  },
+  progress: { get: jest.fn() },
+  style: { aside: jest.fn() },
+  writeText: jest.fn(),
+  ServerlessError: class ServerlessError extends Error {
+    constructor(message, code) {
+      super(message)
+      this.code = code
+    }
+  },
+  ServerlessErrorCodes: {},
+  addProxyToAwsClient: jest.fn((client) => client),
+  stringToSafeColor: jest.fn((str) => str),
+  getPluginWriters: jest.fn(() => ({})),
+  getPluginConstructors: jest.fn(() => ({})),
+  write: jest.fn(),
+  getOrCreateGlobalDeploymentBucket: jest.fn(),
+}))
+
+const { default: Package } =
+  await import('../../../../../../lib/plugins/package/package.js')
+const { default: Serverless } =
+  await import('../../../../../../lib/serverless.js')
+const { log: mockedLog } = await import('@serverless/util')
+
+describe('zipService', () => {
+  let tmpDirPath
+  let serverless
+  let packagePlugin
+  let params
+
+  function getTmpDirPath() {
+    return path.join(
+      os.tmpdir(),
+      'serverless-test-' +
+        Date.now() +
+        '-' +
+        Math.random().toString(36).slice(2),
+    )
+  }
+
+  beforeEach(() => {
+    tmpDirPath = getTmpDirPath()
+    fs.mkdirSync(tmpDirPath, { recursive: true })
+    serverless = new Serverless({ commands: [], options: {} })
+    serverless.service.service = 'first-service'
+    serverless.serviceDir = tmpDirPath
+    serverless.config = { serviceDir: tmpDirPath }
+    serverless.utils = {
+      writeFileSync: (filePath, content) => {
+        fs.mkdirSync(path.dirname(filePath), { recursive: true })
+        fs.writeFileSync(filePath, content)
+      },
+      writeFileDir: (filePath) => {
+        fs.mkdirSync(path.dirname(filePath), { recursive: true })
+      },
+    }
+    packagePlugin = new Package(serverless, {})
+    params = {
+      include: ['user-defined-include-me'],
+      exclude: ['user-defined-exclude-me'],
+      zipFileName: 'my-service.zip',
+    }
+  })
+
+  afterEach(async () => {
+    // Clean up temp directory
+    try {
+      await fsp.rm(tmpDirPath, { recursive: true, force: true })
+    } catch {
+      // Ignore cleanup errors
+    }
+  })
+
+  describe('#zipService()', () => {
+    it('should run promise chain in order', async () => {
+      const excludeDevDependenciesSpy = jest
+        .spyOn(packagePlugin, 'excludeDevDependencies')
+        .mockResolvedValue(params)
+      const zipSpy = jest.spyOn(packagePlugin, 'zip').mockResolvedValue()
+
+      const { exclude, include, zipFileName } = params
+
+      await packagePlugin.zipService(exclude, include, zipFileName)
+
+      expect(excludeDevDependenciesSpy).toHaveBeenCalledTimes(1)
+      expect(zipSpy).toHaveBeenCalledTimes(1)
+
+      excludeDevDependenciesSpy.mockRestore()
+      zipSpy.mockRestore()
+    })
+  })
+
+  describe('#getFileContentAndStat()', () => {
+    it('should keep the file content as is', async () => {
+      const buf = Buffer.from([10, 20, 30, 40, 50])
+      const filePath = path.join(tmpDirPath, 'bin-file')
+
+      fs.writeFileSync(filePath, buf)
+
+      const result = await packagePlugin.getFileContentAndStat('bin-file')
+      expect(result.data).toEqual(buf)
+    })
+
+    it('should return file stat information', async () => {
+      const filePath = path.join(tmpDirPath, 'test-file.js')
+      fs.writeFileSync(filePath, 'console.log("test")')
+
+      const result = await packagePlugin.getFileContentAndStat('test-file.js')
+      expect(result.stat).toBeDefined()
+      expect(result.stat.mode).toBeDefined()
+      expect(result.filePath).toBe('test-file.js')
+    })
+  })
+
+  describe('#excludeDevDependencies()', () => {
+    it('should resolve when opted out of dev dependency exclusion', async () => {
+      packagePlugin.serverless.service.package.excludeDevDependencies = false
+
+      const updatedParams = await packagePlugin.excludeDevDependencies(params)
+      expect(updatedParams).toEqual(params)
+    })
+
+    it('should return params unchanged if no package.json files found', async () => {
+      // No package.json in tmpDirPath
+      const updatedParams = await packagePlugin.excludeDevDependencies(params)
+
+      expect(updatedParams.exclude).toContain('user-defined-exclude-me')
+      expect(updatedParams.include).toContain('user-defined-include-me')
+      expect(updatedParams.zipFileName).toBe(params.zipFileName)
+    })
+  })
+
+  describe('#excludeDevDependencies() - node dependency resolution', () => {
+    // Each test spawns real `npm ls` processes; on the standard Windows CI
+    // runner a single test can take over a minute, so the default 5s per-test
+    // timeout is far too tight.
+    jest.setTimeout(180_000)
+
+    // Separator-agnostic so assertions hold on both POSIX ("node_modules/x/**")
+    // and Windows ("node_modules\\x\\**") glob output.
+    const isExcluded = (globs, name) =>
+      globs.some((glob) =>
+        new RegExp(`node_modules[\\\\/]${name}[\\\\/]`).test(glob),
+      )
+    let serviceDir
+
+    beforeEach(() => {
+      // `npm ls` reports realpaths; on macOS os.tmpdir() lives under the
+      // /var -> /private/var symlink, so resolve the service dir to its real
+      // path to match npm's output (real projects are not under such a link).
+      serviceDir = fs.realpathSync(tmpDirPath)
+      packagePlugin.serverless.serviceDir = serviceDir
+    })
+
+    function writePackageJson(dir, contents) {
+      fs.mkdirSync(dir, { recursive: true })
+      fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify(contents))
+    }
+
+    // Builds a real project whose node_modules contains one prod-only and one
+    // dev-only package so `npm ls` reports a deterministic tree.
+    function scaffoldProject({ declareMissingDep = false } = {}) {
+      writePackageJson(serviceDir, {
+        name: 'exclude-dev-deps-test',
+        version: '1.0.0',
+        dependencies: {
+          'prod-pkg': '1.0.0',
+          // A declared-but-not-installed dependency makes `npm ls` exit 1.
+          ...(declareMissingDep ? { 'missing-pkg': '1.0.0' } : {}),
+        },
+        devDependencies: { 'dev-pkg': '1.0.0' },
+      })
+      writePackageJson(path.join(serviceDir, 'node_modules', 'prod-pkg'), {
+        name: 'prod-pkg',
+        version: '1.0.0',
+      })
+      writePackageJson(path.join(serviceDir, 'node_modules', 'dev-pkg'), {
+        name: 'dev-pkg',
+        version: '1.0.0',
+      })
+    }
+
+    it('excludes dev-only dependencies and keeps prod dependencies', async () => {
+      scaffoldProject()
+
+      const updated = await packagePlugin.excludeDevDependencies(params)
+
+      expect(isExcluded(updated.exclude, 'dev-pkg')).toBe(true)
+      expect(isExcluded(updated.exclude, 'prod-pkg')).toBe(false)
+    })
+
+    it('still excludes dev-only dependencies when npm ls exits non-zero', async () => {
+      // `npm ls` exits 1 on a missing declared dependency but still prints a
+      // partial tree; that partial output must not be lost.
+      scaffoldProject({ declareMissingDep: true })
+
+      const updated = await packagePlugin.excludeDevDependencies(params)
+
+      expect(isExcluded(updated.exclude, 'dev-pkg')).toBe(true)
+      expect(isExcluded(updated.exclude, 'prod-pkg')).toBe(false)
+    })
+
+    it('handles services with only development dependencies', async () => {
+      // A production listing of such a project legitimately contains no
+      // packages (just the project root); this must exclude the dev
+      // dependencies and must not be treated as a listing failure.
+      writePackageJson(serviceDir, {
+        name: 'dev-only-test',
+        version: '1.0.0',
+        devDependencies: { 'dev-pkg': '1.0.0' },
+      })
+      writePackageJson(path.join(serviceDir, 'node_modules', 'dev-pkg'), {
+        name: 'dev-pkg',
+        version: '1.0.0',
+      })
+
+      const updated = await packagePlugin.excludeDevDependencies(params)
+
+      expect(isExcluded(updated.exclude, 'dev-pkg')).toBe(true)
+    })
+
+    it('does not execute shell metacharacters injected via the temp path', async () => {
+      if (os.platform() === 'win32') {
+        // POSIX-shell payload; temp-path handling is exercised on *nix.
+        return
+      }
+      // A project `.env` can set TMPDIR/TMP/TEMP before packaging and
+      // `os.tmpdir()` honors them, so os.tmpdir() may return an
+      // attacker-influenced value. Model that value carrying a shell breakout
+      // and prove the temp path can no longer execute commands.
+      const unique = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+      const realTmp = fs.realpathSync(os.tmpdir())
+      const marker = path.join(realTmp, `sls-pwn-${unique}`)
+      const redirectJunk = path.join(realTmp, `sls-junk-${unique}`)
+      const maliciousTmp = `${redirectJunk}; touch ${marker} #`
+      const tmpdirSpy = jest.spyOn(os, 'tmpdir').mockReturnValue(maliciousTmp)
+
+      // A package.json is enough to reach the `npm ls` invocation.
+      writePackageJson(serviceDir, { name: 'pwn-test', version: '1.0.0' })
+
+      let markerCreated
+      try {
+        const updated = await packagePlugin.excludeDevDependencies(params)
+        // Capture the effect before cleanup so removal can't mask a breakout.
+        markerCreated = fs.existsSync(marker)
+        // Packaging still resolves gracefully.
+        expect(updated.zipFileName).toBe(params.zipFileName)
+      } finally {
+        tmpdirSpy.mockRestore()
+        fs.rmSync(marker, { force: true })
+        fs.rmSync(redirectJunk, { force: true })
+      }
+
+      expect(markerCreated).toBe(false)
+    })
+
+    // Shims `npm` via PATH so the two `npm ls` listings can be made to fail
+    // independently — a hard failure produces no stdout at all, unlike the
+    // tolerated non-zero exits that still print a partial tree.
+    function shimNpm({ failDev, failProd }) {
+      const shimDir = path.join(serviceDir, '.npm-shim')
+      fs.mkdirSync(shimDir, { recursive: true })
+      const tree = [
+        serviceDir,
+        path.join(serviceDir, 'node_modules', 'dev-pkg'),
+        path.join(serviceDir, 'node_modules', 'prod-pkg'),
+      ]
+      const prodTree = [
+        serviceDir,
+        path.join(serviceDir, 'node_modules', 'prod-pkg'),
+      ]
+      const script = [
+        '#!/bin/sh',
+        'case "$*" in',
+        `  *"--omit=dev"*) ${
+          failProd
+            ? 'echo "simulated npm failure" >&2; exit 1'
+            : `printf '%s\\n' ${prodTree.map((p) => `'${p}'`).join(' ')}`
+        } ;;`,
+        `  *) ${
+          failDev
+            ? 'echo "simulated npm failure" >&2; exit 1'
+            : `printf '%s\\n' ${tree.map((p) => `'${p}'`).join(' ')}`
+        } ;;`,
+        'esac',
+      ].join('\n')
+      const shimPath = path.join(shimDir, 'npm')
+      fs.writeFileSync(shimPath, script, { mode: 0o755 })
+      return shimDir
+    }
+
+    const itPosix = os.platform() === 'win32' ? it.skip : it
+
+    itPosix(
+      'stops packaging when the production dependency listing produces no output',
+      async () => {
+        scaffoldProject()
+        const shimDir = shimNpm({ failDev: false, failProd: true })
+        const originalPath = process.env.PATH
+        process.env.PATH = `${shimDir}${path.delimiter}${originalPath}`
+        try {
+          await expect(
+            packagePlugin.excludeDevDependencies(params),
+          ).rejects.toThrow(/production dependencies/)
+        } finally {
+          process.env.PATH = originalPath
+        }
+      },
+    )
+
+    itPosix(
+      'skips exclusion when no dependency listing is available',
+      async () => {
+        scaffoldProject()
+        const shimDir = shimNpm({ failDev: true, failProd: true })
+        const originalPath = process.env.PATH
+        process.env.PATH = `${shimDir}${path.delimiter}${originalPath}`
+        try {
+          const updated = await packagePlugin.excludeDevDependencies(params)
+          // Nothing is excluded; the artifact keeps all dependencies.
+          expect(isExcluded(updated.exclude, 'dev-pkg')).toBe(false)
+          expect(isExcluded(updated.exclude, 'prod-pkg')).toBe(false)
+        } finally {
+          process.env.PATH = originalPath
+        }
+      },
+    )
+
+    itPosix(
+      'warns and skips exclusion when only the development listing is unavailable',
+      async () => {
+        scaffoldProject()
+        const shimDir = shimNpm({ failDev: true, failProd: false })
+        const originalPath = process.env.PATH
+        process.env.PATH = `${shimDir}${path.delimiter}${originalPath}`
+        try {
+          const updated = await packagePlugin.excludeDevDependencies(params)
+          // Without the full listing there are no removal candidates; the
+          // artifact keeps all dependencies and the skip is surfaced.
+          expect(isExcluded(updated.exclude, 'dev-pkg')).toBe(false)
+          expect(isExcluded(updated.exclude, 'prod-pkg')).toBe(false)
+          expect(mockedLog.warning).toHaveBeenCalledWith(
+            expect.stringContaining(
+              'Skipping development dependency exclusion',
+            ),
+          )
+        } finally {
+          process.env.PATH = originalPath
+        }
+      },
+    )
+  })
+
+  describe('#zip()', () => {
+    const testDirectory = {
+      '.': {
+        'event.json': 'some content',
+        'handler.js': 'some content',
+        'file-1': 'some content',
+        'file-2': 'some content',
+      },
+      bin: {
+        'binary-777': { content: 'some content', permissions: 0o777 },
+        'binary-444': { content: 'some content', permissions: 0o444 },
+      },
+      lib: {
+        'file-1.js': 'some content',
+      },
+      'lib/directory-1': {
+        'file-1.js': 'some content',
+      },
+      'node_modules/directory-1': {
+        'file-1': 'some content',
+        'file-2': 'some content',
+      },
+      'node_modules/directory-2': {
+        'file-1': 'some content',
+        'file-2': 'some content',
+      },
+    }
+
+    function getTestArtifactFileName(testName) {
+      return `test-${testName}-${Date.now()}.zip`
+    }
+
+    beforeEach(() => {
+      Object.keys(testDirectory).forEach((dirName) => {
+        const dirPath = path.join(tmpDirPath, dirName)
+        const files = testDirectory[dirName]
+
+        Object.keys(files).forEach((fileName) => {
+          const filePath = path.join(dirPath, fileName)
+          const fileValue = files[fileName]
+          const file =
+            typeof fileValue === 'object' ? fileValue : { content: fileValue }
+
+          if (!file.content) {
+            throw new Error('File content is required')
+          }
+
+          serverless.utils.writeFileSync(filePath, file.content)
+
+          if (file.permissions) {
+            fs.chmodSync(filePath, file.permissions)
+          }
+        })
+      })
+    })
+
+    it('should zip a whole service (without include / exclude usage)', async () => {
+      params.zipFileName = getTestArtifactFileName('whole-service')
+
+      const artifact = await packagePlugin.zip(params)
+      expect(artifact).toBe(
+        path.join(serverless.serviceDir, '.serverless', params.zipFileName),
+      )
+
+      const data = fs.readFileSync(artifact)
+      const zip = new JsZip()
+      const unzippedData = await zip.loadAsync(data)
+      const unzippedFileData = unzippedData.files
+
+      const fileCount = Object.keys(unzippedFileData).filter(
+        (file) => !unzippedFileData[file].dir,
+      ).length
+      expect(fileCount).toBe(12)
+
+      // root directory
+      expect(unzippedFileData['event.json']).toBeDefined()
+      expect(unzippedFileData['handler.js']).toBeDefined()
+      expect(unzippedFileData['file-1']).toBeDefined()
+      expect(unzippedFileData['file-2']).toBeDefined()
+
+      // bin directory
+      expect(unzippedFileData['bin/binary-777']).toBeDefined()
+      expect(unzippedFileData['bin/binary-444']).toBeDefined()
+
+      // lib directory
+      expect(unzippedFileData['lib/file-1.js']).toBeDefined()
+      expect(unzippedFileData['lib/directory-1/file-1.js']).toBeDefined()
+
+      // node_modules directory
+      expect(unzippedFileData['node_modules/directory-1/file-1']).toBeDefined()
+      expect(unzippedFileData['node_modules/directory-1/file-2']).toBeDefined()
+      expect(unzippedFileData['node_modules/directory-2/file-1']).toBeDefined()
+      expect(unzippedFileData['node_modules/directory-2/file-2']).toBeDefined()
+    })
+
+    it('should keep file permissions', async () => {
+      if (os.platform() === 'win32') {
+        // chmod does not work right on windows
+        return
+      }
+
+      params.zipFileName = getTestArtifactFileName('file-permissions')
+
+      const artifact = await packagePlugin.zip(params)
+      const data = fs.readFileSync(artifact)
+      const zip = new JsZip()
+      const unzippedData = await zip.loadAsync(data)
+      const unzippedFileData = unzippedData.files
+
+      // binary file is set with chmod of 777 -> should be 755 in zip
+      expect(unzippedFileData['bin/binary-777'].unixPermissions).toBe(
+        Math.pow(2, 15) + 0o755,
+      )
+
+      // read only file is set with chmod of 444 -> should be 644 in zip
+      expect(unzippedFileData['bin/binary-444'].unixPermissions).toBe(
+        Math.pow(2, 15) + 0o644,
+      )
+    })
+
+    it('should exclude with globs', async () => {
+      params.zipFileName = getTestArtifactFileName('exclude-with-globs')
+      params.exclude = ['event.json', 'lib/**', 'node_modules/directory-1/**']
+
+      const artifact = await packagePlugin.zip(params)
+      const data = fs.readFileSync(artifact)
+      const zip = new JsZip()
+      const unzippedData = await zip.loadAsync(data)
+      const unzippedFileData = unzippedData.files
+
+      const fileCount = Object.keys(unzippedFileData).filter(
+        (file) => !unzippedFileData[file].dir,
+      ).length
+      expect(fileCount).toBe(7)
+
+      // root directory
+      expect(unzippedFileData['handler.js']).toBeDefined()
+      expect(unzippedFileData['file-1']).toBeDefined()
+      expect(unzippedFileData['file-2']).toBeDefined()
+
+      // bin directory
+      expect(unzippedFileData['bin/binary-777']).toBeDefined()
+      expect(unzippedFileData['bin/binary-444']).toBeDefined()
+
+      // node_modules directory
+      expect(unzippedFileData['node_modules/directory-2/file-1']).toBeDefined()
+      expect(unzippedFileData['node_modules/directory-2/file-2']).toBeDefined()
+
+      // excluded
+      expect(unzippedFileData['event.json']).toBeUndefined()
+      expect(unzippedFileData['lib/file-1.js']).toBeUndefined()
+      expect(
+        unzippedFileData['node_modules/directory-1/file-1'],
+      ).toBeUndefined()
+    })
+
+    it('should re-include files using ! glob pattern', async () => {
+      params.zipFileName = getTestArtifactFileName('re-include-with-globs')
+      params.exclude = [
+        'event.json',
+        'lib/**',
+        'node_modules/directory-1/**',
+        '!event.json', // re-include
+        '!lib/**', // re-include
+      ]
+
+      const artifact = await packagePlugin.zip(params)
+      const data = fs.readFileSync(artifact)
+      const zip = new JsZip()
+      const unzippedData = await zip.loadAsync(data)
+      const unzippedFileData = unzippedData.files
+
+      const fileCount = Object.keys(unzippedFileData).filter(
+        (file) => !unzippedFileData[file].dir,
+      ).length
+      expect(fileCount).toBe(10)
+
+      // root directory (re-included)
+      expect(unzippedFileData['event.json']).toBeDefined()
+      expect(unzippedFileData['handler.js']).toBeDefined()
+
+      // lib directory (re-included)
+      expect(unzippedFileData['lib/file-1.js']).toBeDefined()
+      expect(unzippedFileData['lib/directory-1/file-1.js']).toBeDefined()
+
+      // node_modules directory (directory-1 still excluded)
+      expect(unzippedFileData['node_modules/directory-2/file-1']).toBeDefined()
+      expect(
+        unzippedFileData['node_modules/directory-1/file-1'],
+      ).toBeUndefined()
+    })
+
+    it('should re-include files using include config', async () => {
+      params.zipFileName = getTestArtifactFileName('re-include-with-include')
+      params.exclude = ['event.json', 'lib/**', 'node_modules/directory-1/**']
+      params.include = ['event.json', 'lib/**']
+
+      const artifact = await packagePlugin.zip(params)
+      const data = fs.readFileSync(artifact)
+      const zip = new JsZip()
+      const unzippedData = await zip.loadAsync(data)
+      const unzippedFileData = unzippedData.files
+
+      const fileCount = Object.keys(unzippedFileData).filter(
+        (file) => !unzippedFileData[file].dir,
+      ).length
+      expect(fileCount).toBe(10)
+
+      // root directory (re-included)
+      expect(unzippedFileData['event.json']).toBeDefined()
+
+      // lib directory (re-included)
+      expect(unzippedFileData['lib/file-1.js']).toBeDefined()
+    })
+
+    it('should throw an error if no files are matched', async () => {
+      params.exclude = ['**/**']
+      params.include = []
+      params.zipFileName = getTestArtifactFileName('empty')
+
+      await expect(packagePlugin.zip(params)).rejects.toThrow(
+        /file matches include \/ exclude/,
+      )
+    })
+  })
+
+  describe('#zipFiles()', () => {
+    it('should throw an error if no files are provided', async () => {
+      await expect(
+        packagePlugin.zipFiles([], path.resolve(tmpDirPath, 'tmp.zip')),
+      ).rejects.toThrow(/No files to package/)
+    })
+
+    describe('with generated entries', () => {
+      const generatedEntries = [
+        { name: 'b-generated.mjs', content: 'export {}\n' },
+      ]
+
+      beforeEach(() => {
+        fs.writeFileSync(path.join(tmpDirPath, 'a.js'), 'a')
+        fs.writeFileSync(path.join(tmpDirPath, 'c.js'), 'c')
+      })
+
+      it('adds them to the zip in sorted order with a pinned date and mode', async () => {
+        const artifact = await packagePlugin.zipFiles(
+          ['c.js', 'a.js'],
+          'generated.zip',
+          undefined,
+          { generatedEntries },
+        )
+
+        const zip = await new JsZip().loadAsync(fs.readFileSync(artifact))
+        expect(Object.keys(zip.files)).toEqual([
+          'a.js',
+          'b-generated.mjs',
+          'c.js',
+        ])
+        const entry = zip.files['b-generated.mjs']
+        expect(await entry.async('string')).toBe('export {}\n')
+        // new Date(0) is before the zip epoch, so it is stored as 1980-01-01
+        expect(entry.date.getUTCFullYear()).toBe(1980)
+        expect(entry.date.getUTCMonth()).toBe(0)
+        expect(entry.date.getUTCDate()).toBe(1)
+        if (os.platform() !== 'win32') {
+          expect(entry.unixPermissions).toBe(Math.pow(2, 15) + 0o644)
+        }
+      })
+
+      it('replaces a packaged file with the same name', async () => {
+        fs.writeFileSync(path.join(tmpDirPath, 'b-generated.mjs'), 'user file')
+
+        const artifact = await packagePlugin.zipFiles(
+          ['a.js', 'b-generated.mjs'],
+          'replaced.zip',
+          undefined,
+          { generatedEntries },
+        )
+
+        const zip = await new JsZip().loadAsync(fs.readFileSync(artifact))
+        expect(Object.keys(zip.files)).toEqual(['a.js', 'b-generated.mjs'])
+        expect(await zip.files['b-generated.mjs'].async('string')).toBe(
+          'export {}\n',
+        )
+      })
+
+      it('produces byte-identical zips for identical input', async () => {
+        const first = await packagePlugin.zipFiles(
+          ['a.js', 'c.js'],
+          'first.zip',
+          undefined,
+          { generatedEntries },
+        )
+        // File times never reach the zip
+        const later = new Date(Date.now() + 60_000)
+        fs.utimesSync(path.join(tmpDirPath, 'a.js'), later, later)
+        const second = await packagePlugin.zipFiles(
+          ['c.js', 'a.js'],
+          'second.zip',
+          undefined,
+          { generatedEntries },
+        )
+
+        expect(fs.readFileSync(first).equals(fs.readFileSync(second))).toBe(
+          true,
+        )
+      })
+    })
+  })
+})

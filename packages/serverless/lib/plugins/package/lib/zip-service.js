@@ -1,0 +1,440 @@
+import { ZipArchive } from 'archiver'
+import os from 'os'
+import path from 'path'
+import crypto from 'crypto'
+import fs from 'fs'
+import fsp from 'fs/promises'
+import { promisify } from 'util'
+import * as child from 'child_process'
+import { globbySync } from 'globby'
+import _ from 'lodash'
+import pMap from 'p-map'
+import pReduce from 'p-reduce'
+import pMapSeries from 'p-map-series'
+import ServerlessError from '../../../serverless-error.js'
+import { log } from '@serverless/util'
+
+const { createWriteStream, unlinkSync } = fs
+const execAsync = promisify(child.exec)
+
+const excludeNodeDevDependenciesMemoized = _.memoize(excludeNodeDevDependencies)
+
+export default {
+  async zipService(exclude, include, zipFileName) {
+    const params = await this.excludeDevDependencies({
+      exclude,
+      include,
+      zipFileName,
+    })
+    return this.zip(params)
+  },
+
+  async excludeDevDependencies(params) {
+    const serviceDir = this.serverless.serviceDir
+
+    let excludeDevDependencies =
+      this.serverless.service.package.excludeDevDependencies
+    if (
+      excludeDevDependencies === undefined ||
+      excludeDevDependencies === null
+    ) {
+      excludeDevDependencies = true
+    }
+
+    if (excludeDevDependencies) {
+      if (params.contextName) {
+        log.info(`Excluding development dependencies for ${params.contextName}`)
+      } else {
+        log.info('Excluding development dependencies')
+      }
+
+      const exAndInNode = await excludeNodeDevDependenciesMemoized(serviceDir)
+      params.exclude = _.union(params.exclude, exAndInNode.exclude)
+      params.include = _.union(params.include, exAndInNode.include)
+      params.devDependencyExcludeSet = new Set(exAndInNode.exclude)
+      return params
+    }
+
+    return params
+  },
+
+  async zip(params) {
+    return this.resolveFilePathsFromPatterns(params).then((filePaths) =>
+      this.zipFiles(filePaths, params.zipFileName),
+    )
+  },
+
+  /**
+   * Create a zip file on disk from an array of filenames of files on disk
+   * @param files - an Array of filenames
+   * @param zipFiles - the filename to save the zip at
+   * @param prefix - a prefix to strip from the file names. use for layers support
+   * @param options.generatedEntries - files that exist only in the zip, as
+   *   `{ name, content }`; one replaces a file of the same name
+   */
+  async zipFiles(files, zipFileName, prefix, { generatedEntries = [] } = {}) {
+    if (files.length === 0) {
+      const error = new ServerlessError(
+        'No files to package',
+        'NO_FILES_TO_PACKAGE',
+      )
+      return Promise.reject(error)
+    }
+
+    const zip = new ZipArchive()
+    // Create artifact in temp path and move it to the package path (if any) later
+    const artifactFilePath = path.join(
+      this.serverless.serviceDir,
+      '.serverless',
+      zipFileName,
+    )
+    this.serverless.utils.writeFileDir(artifactFilePath)
+    const output = createWriteStream(artifactFilePath)
+
+    return new Promise((resolve, reject) => {
+      output.on('close', () => resolve(artifactFilePath))
+      output.on('error', (err) => reject(err))
+      zip.on('error', (err) => reject(err))
+
+      output.on('open', () => {
+        zip.pipe(output)
+
+        // normalize both maps to avoid problems with e.g. Path Separators in different shells
+        const normalizedFiles = _.uniq(
+          files.map((file) => path.normalize(file)),
+        )
+
+        return pMap(normalizedFiles, this.getFileContentAndStat.bind(this), {
+          concurrency: os.cpus().length,
+        })
+          .then((contents) => {
+            const generatedNames = new Set(
+              generatedEntries.map(({ name }) => name),
+            )
+            const entries = contents
+              .map((file) => ({
+                name: file.filePath.slice(
+                  prefix ? `${prefix}${path.sep}`.length : 0,
+                ),
+                data: file.data,
+                // Ensure file is executable if it is locally executable or
+                // we force it to be executable if platform is windows
+                mode:
+                  file.stat.mode & 0o100 || process.platform === 'win32'
+                    ? 0o755
+                    : 0o644,
+              }))
+              .filter(({ name }) => !generatedNames.has(name))
+              .concat(
+                generatedEntries.map(({ name, content }) => ({
+                  name,
+                  data: content,
+                  mode: 0o644,
+                })),
+              )
+
+            entries
+              .sort((entry1, entry2) => entry1.name.localeCompare(entry2.name))
+              .forEach(({ name, data, mode }) => {
+                zip.append(data, {
+                  name,
+                  mode,
+                  date: new Date(0), // necessary to get the same hash when zipping the same content
+                })
+              })
+
+            zip.finalize()
+          })
+          .catch(reject)
+      })
+    })
+  },
+
+  async getFileContentAndStat(filePath) {
+    const fullPath = path.resolve(this.serverless.serviceDir, filePath)
+
+    return Promise.all([
+      // Get file contents and stat in parallel
+      this.getFileContent(fullPath),
+      fsp.stat(fullPath),
+    ]).then(
+      (result) => ({
+        data: result[0],
+        stat: result[1],
+        filePath,
+      }),
+      (error) => {
+        throw new ServerlessError(
+          `Cannot read file ${filePath} due to: ${error.message}`,
+          'CANNOT_READ_FILE',
+        )
+      },
+    )
+  },
+
+  // Useful point of entry for e.g. transpilation plugins
+  getFileContent(fullPath) {
+    return fsp.readFile(fullPath)
+  },
+}
+
+async function excludeNodeDevDependencies(serviceDir) {
+  const exAndIn = {
+    include: [],
+    exclude: [],
+  }
+
+  // `npm ls` invocations that produced no output at all, per listing kind.
+  const listingHardFailures = { dev: [], prod: [] }
+
+  // the files where we'll write the dependencies into
+  const tmpDir = os.tmpdir()
+  const randHash = crypto.randomBytes(8).toString('hex')
+  const nodeDevDepFile = path.join(tmpDir, `node-dependencies-${randHash}-dev`)
+  const nodeProdDepFile = path.join(
+    tmpDir,
+    `node-dependencies-${randHash}-prod`,
+  )
+
+  try {
+    const packageJsonFilePaths = globbySync(
+      [
+        '**/package.json',
+        // TODO add glob for node_modules filtering
+      ],
+      {
+        cwd: serviceDir,
+        dot: true,
+        silent: true,
+        follow: true,
+        nosort: true,
+      },
+    )
+
+    // filter out non node_modules file paths
+    const packageJsonPaths = packageJsonFilePaths.filter((filePath) => {
+      const isNodeModulesDir = !!filePath.match(/node_modules/)
+      return !isNodeModulesDir
+    })
+
+    if (!packageJsonPaths.length) {
+      return Promise.resolve(exAndIn)
+    }
+
+    // NOTE: using mapSeries here for a sequential computation (w/o race conditions)
+    return (
+      pMapSeries(packageJsonPaths, (packageJsonPath) => {
+        // the path where the package.json file lives
+        const fullPath = path.join(serviceDir, packageJsonPath)
+        const dirWithPackageJson = fullPath.replace(
+          path.join(path.sep, 'package.json'),
+          '',
+        )
+
+        // we added a catch which resolves so that npm commands with an exit code of 1
+        // (e.g. if the package.json is invalid) won't crash the dev dependency exclusion process
+        return pMap(
+          ['dev', 'prod'],
+          (env) => {
+            const depFile = env === 'dev' ? nodeDevDepFile : nodeProdDepFile
+            // Capture `npm ls` output and write it to `depFile` from Node
+            // rather than via a shell redirection, so the (potentially
+            // environment-derived) temp path never becomes part of the command
+            // string that a shell interprets.
+            // `--include=dev` / `--omit=dev` are the canonical flags across
+            // npm 7+, and npm documents the older spellings as their aliases
+            // (`dev` -> `--include=dev`, `production` -> `--omit=dev`).
+            // npm 12 errors on abbreviated flags, which rejects `--prod`
+            // (an abbreviation of `--production`).
+            return execAsync(
+              `npm ls --${env === 'dev' ? 'include=dev' : 'omit=dev'} --parseable=true --long=false --silent --all`,
+              {
+                cwd: dirWithPackageJson,
+                // We are overriding `NODE_ENV` because when it is set to "production"
+                // it causes invalid output of `npm ls` with `--dev=true`
+                env: {
+                  ...process.env,
+                  NODE_ENV: null,
+                },
+                // Output was previously streamed straight to disk and so was
+                // unbounded; keep a generous limit so large dependency trees
+                // are not truncated (which could drop required dependencies).
+                maxBuffer: 1024 * 1024 * 1024,
+              },
+            )
+              .then(({ stdout }) => fsp.appendFile(depFile, stdout))
+              .catch((err) => {
+                log.debug(
+                  `Failed to run npm ls to retrieve dependencies for exclusion. Error: ${err.message}`,
+                )
+                // A failure without any stdout means no tree was produced at
+                // all (as opposed to the tolerated non-zero exits that still
+                // print a partial tree); record it for the guard below.
+                if (!err.stdout) {
+                  listingHardFailures[env].push(
+                    (err.stderr || err.message || '')
+                      .split(/[\r\n]+/)
+                      .map((l) => l.trim())
+                      .find(Boolean) || 'unknown error',
+                  )
+                }
+                // `npm ls` exits non-zero on missing/invalid deps but still
+                // prints a partial tree on stdout; preserve it as the previous
+                // shell redirection did. Append unconditionally so the file
+                // exists even when there is no output.
+                return fsp.appendFile(depFile, err.stdout || '').catch(() => {})
+              })
+          },
+          { concurrency: os.cpus().length },
+        )
+      })
+        // NOTE: using mapSeries here for a sequential computation (w/o race conditions)
+        .then(() =>
+          pMapSeries(['dev', 'prod'], (env) => {
+            const depFile = env === 'dev' ? nodeDevDepFile : nodeProdDepFile
+            return fsp
+              .readFile(depFile)
+              .then((fileContent) =>
+                _.uniq(fileContent.toString('utf8').split(/[\r\n]+/)).filter(
+                  Boolean,
+                ),
+              )
+              .catch((err) => {
+                log.debug(
+                  `Failed to read the dependencies exclusion file at ${depFile}. Error: ${err.message}`,
+                )
+              })
+          }),
+        )
+        .then(async (devAndProDependencies) => {
+          const devDependencies = devAndProDependencies[0] || []
+          const prodDependencies = devAndProDependencies[1] || []
+
+          // `npm ls --parseable` prints at least the project root on success
+          // and keeps a partial tree on stdout for ordinary listing errors
+          // (missing or invalid dependencies), so a listing without any
+          // output at all — whether it failed outright or reported success —
+          // means that dependency inventory is unusable. Excluding based on
+          // a dev listing without the matching production listing would
+          // remove production dependencies from the artifact, so stop
+          // packaging instead.
+          if (
+            (listingHardFailures.prod.length || !prodDependencies.length) &&
+            devDependencies.length
+          ) {
+            const reason =
+              listingHardFailures.prod[0] ||
+              'the command reported success but returned no dependency data'
+            throw new ServerlessError(
+              'Unable to determine production dependencies for dev-dependency exclusion' +
+                ` ("npm ls" produced no output: ${reason}).` +
+                ' Packaging was stopped because continuing could exclude production dependencies from the deployment artifact.' +
+                ' To package without dev-dependency exclusion, set "package.excludeDevDependencies: false".',
+              'DEV_DEPENDENCY_EXCLUSION_LISTING_FAILED',
+            )
+          }
+          if (!devDependencies.length) {
+            if (listingHardFailures.dev.length) {
+              log.warning(
+                'Skipping development dependency exclusion: unable to inventory dependencies' +
+                  ` ("npm ls" produced no output: ${listingHardFailures.dev[0]}).`,
+              )
+            }
+            return exAndIn
+          }
+
+          // NOTE: the order for _.difference is important
+          const dependencies = _.difference(devDependencies, prodDependencies)
+          const nodeModulesRegex = new RegExp(
+            `${path.join('node_modules', path.sep)}.*`,
+            'g',
+          )
+
+          if (dependencies.length) {
+            return pMap(
+              dependencies,
+              (item) => item.replace(path.join(serviceDir, path.sep), ''),
+              { concurrency: os.cpus().length },
+            )
+              .then((processedDependencies) => {
+                return processedDependencies.filter(
+                  (item) => item.length > 0 && item.match(nodeModulesRegex),
+                )
+              })
+              .then((filteredDependencies) =>
+                pReduce(
+                  filteredDependencies,
+                  (globs, item) => {
+                    const packagePath = path.join(
+                      serviceDir,
+                      item,
+                      'package.json',
+                    )
+                    return fsp
+                      .readFile(packagePath, 'utf-8')
+                      .then((packageJsonFile) => {
+                        const lastIndex = item.lastIndexOf(path.sep) + 1
+                        const moduleName = item.slice(lastIndex)
+                        const modulePath = item.slice(0, lastIndex)
+
+                        const packageJson = JSON.parse(packageJsonFile)
+                        const bin = packageJson.bin
+
+                        const baseGlobs = [path.join(item, '**')]
+
+                        // NOTE: pkg.bin can be object, string, or undefined
+                        if (typeof bin === 'object') {
+                          Object.keys(bin).forEach((executable) => {
+                            baseGlobs.push(
+                              path.join(modulePath, '.bin', executable),
+                            )
+                          })
+                          // only 1 executable with same name as lib
+                        } else if (typeof bin === 'string') {
+                          baseGlobs.push(
+                            path.join(modulePath, '.bin', moduleName),
+                          )
+                        }
+
+                        return globs.concat(baseGlobs) // Append to the accumulator
+                      })
+                      .catch((err) => {
+                        log.debug(
+                          `Unable to read the package.json file at "${packagePath}" while processing dependencies for exclusion. Skipping this dependency. Error: ${err.message}`,
+                        )
+                        return globs
+                      }) // Handle errors by returning the existing globs
+                  },
+                  [], // Initial accumulator value for `globs`
+                ),
+              )
+              .then((globs) => {
+                exAndIn.exclude = exAndIn.exclude.concat(globs)
+                return exAndIn
+              })
+          }
+
+          return exAndIn
+        })
+        .finally(() => {
+          // cleanup
+          try {
+            unlinkSync(nodeDevDepFile)
+            unlinkSync(nodeProdDepFile)
+          } catch {
+            // temp files may not exist if listing failed early
+          }
+        })
+        .catch((err) => {
+          // Deliberate packaging errors must reach the user; only incidental
+          // bookkeeping failures are swallowed to keep exclusion best-effort.
+          if (err instanceof ServerlessError) throw err
+          log.debug(`Failed to exclude dev dependencies. Error: ${err.message}`)
+          return exAndIn
+        })
+    )
+  } catch (e) {
+    // fail silently
+    return Promise.resolve(exAndIn)
+  }
+}

@@ -1,0 +1,13 @@
+service: compose-subset-api
+provider:
+  name: aws
+resources:
+  Resources:
+    Param:
+      Type: AWS::SSM::Parameter
+      Properties:
+        Type: String
+        Value: ${param:middleArn}
+  Outputs:
+    StoredValue:
+      Value: ${param:middleArn}

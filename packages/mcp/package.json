@@ -1,0 +1,33 @@
+{
+  "name": "@serverless/mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "lint": "eslint",
+    "prettier": "prettier -c . --ignore-path ../../.prettierignore",
+    "prettier:fix": "prettier -w . --ignore-path ../../.prettierignore",
+    "start": "node src/server.js",
+    "start:stdio": "node src/stdio-server.js",
+    "test:aws-errors-info": "NODE_OPTIONS=\"$NODE_OPTIONS --experimental-vm-modules\" jest tests/e2e/aws-errors-info.test.js",
+    "test:aws-errors-info:unit": "NODE_OPTIONS=\"$NODE_OPTIONS --experimental-vm-modules\" jest tests/aws/aws-errors-info.test.js",
+    "test:aws-errors-info:setup": "node tests/e2e/aws-errors-info-setup.js",
+    "test:aws-errors-info:cleanup": "node tests/e2e/aws-errors-info-cleanup.js",
+    "test:unit": "NODE_OPTIONS=\"$NODE_OPTIONS --experimental-vm-modules\" jest tests/ --testPathIgnorePatterns=/node_modules/ --testPathIgnorePatterns=tests/e2e",
+    "test:e2e": "NODE_OPTIONS=\"$NODE_OPTIONS --experimental-vm-modules\" jest tests/e2e/",
+    "test": "NODE_OPTIONS=\"$NODE_OPTIONS --experimental-vm-modules\" jest tests/"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@serverless/engine": "*",
+    "@serverless/framework": "*",
+    "express": "^5.3.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-cloudwatch-logs": "3.1154.0",
+    "eventsource": "^3.0.7",
+    "jest": "^30.5.2"
+  }
+}

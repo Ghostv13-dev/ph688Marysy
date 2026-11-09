@@ -1,0 +1,8 @@
+{
+  "name": "sls-mixed-rt-shared",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "lodash": "4.18.1"
+  }
+}

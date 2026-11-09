@@ -1,0 +1,1398 @@
+import _ from 'lodash'
+import frameworkCommandsSchema from '@serverless/framework/lib/cli/commands-schema.js'
+import Serverless from '@serverless/framework'
+import resolveInputFinal from '@serverless/framework/lib/cli/resolve-input-final.js'
+import ensureSupportedCommand from '@serverless/framework/lib/cli/ensure-supported-command.js'
+import { movePositionals } from '@serverless/framework/lib/cli/positionals.js'
+import renderGeneralHelp from '@serverless/framework/lib/cli/render-help/general.js'
+import renderCommandHelp from '@serverless/framework/lib/cli/render-help/command.js'
+import { AwsCloudformationService } from '@serverless/engine/src/lib/aws/cloudformation.js'
+import {
+  getAwsCredentialProvider,
+  prepareAwsCredentialResolver,
+} from '../../utils/index.js'
+import {
+  frameworkCommandWithoutPositionals,
+  normalizeDevSelectors,
+} from '../../utils/cli/cli.js'
+import {
+  isAgentSession,
+  log,
+  progress,
+  ServerlessError,
+  ServerlessErrorCodes,
+  writeText,
+} from '@serverless/util'
+import { agentHint } from '@serverless/framework/lib/plugins/aws/dev/attach/output.js'
+import {
+  composeServiceOf,
+  configOf,
+} from '@serverless/framework/lib/plugins/aws/lib/cli-command.js'
+import { Authentication } from '../auth/index.js'
+import { detectServerlessAuth } from './core/agent-env-report.js'
+import { resolveServiceAwsProfile } from '../resolvers/providers/aws/credential-source.js'
+import { providerRegistry } from '../resolvers/registry/index.js'
+import { convertPluginToResolverProvider } from '../resolvers/providers.js'
+import { Runner } from './index.js'
+import { configureLocalstackAWSEndpoint } from '../../utils/local/localstack.js'
+import path from 'path'
+import { stat } from 'node:fs/promises'
+import Esbuild from '@serverless/framework/lib/plugins/esbuild/index.js'
+import {
+  collectArtifactPaths,
+  deriveAnalysisEnrichment,
+} from './framework-analytics.js'
+import { buildCommandState } from './state-utils.js'
+import { buildSandboxesAnalytics } from '@serverless/framework/lib/plugins/aws/sandboxes/analytics.js'
+import { buildMcpAnalytics } from '@serverless/framework/lib/plugins/aws/mcp/analytics.js'
+import { buildWebAppsAnalytics } from '@serverless/framework/lib/plugins/aws/web-apps/analytics.js'
+import { buildProvisionedPollersAnalytics } from '@serverless/framework/lib/plugins/aws/package/compile/events/lib/provisioned-pollers-analytics.js'
+import { Deployment } from '../platform/deployments.js'
+
+// Dev Mode commands that read only the service directory's .serverless/dev and talk to the
+// session running there: they need no stack lookup.
+const LOCAL_DEV_COMMANDS = new Set([
+  'dev status',
+  'dev stop',
+  'dev wait',
+  'dev requests',
+  'dev replay',
+])
+
+/** Whether `command` (its words) is one of them. */
+export const readsOnlyLocalDevState = (command) =>
+  LOCAL_DEV_COMMANDS.has([].concat(command ?? []).join(' '))
+
+/**
+ * The analytics metrics known before the command runs. A command that skips the stack lookup
+ * leaves `stackExistedBeforeRun` unset: it was not looked up, so it is not known.
+ */
+export const metricsBeforeRun = ({ command, serviceUniqueId }) =>
+  readsOnlyLocalDevState(command)
+    ? {}
+    : { stackExistedBeforeRun: Boolean(serviceUniqueId) }
+
+/**
+ * The hint an AI agent gets as the first line of a foreground `serverless dev`, before sign-in,
+ * variable resolution and any AWS call; null for every other run. Agents and sandboxes modes get
+ * none: chosen by option, or by a configuration without functions or MCP servers that has agents
+ * (`ai.agents`) or sandboxes, even with web apps, unless --mode functions asks for that mode. A
+ * configuration with web apps only runs in functions mode and gets the hint. The hint says what
+ * `dev stop` restores: the functions, the web apps, or both. --help, --detach, --dry-run and the
+ * session process get none. A service of a Compose project (`compose`) is named in the commands,
+ * as `serverless <service> dev` runs from the project's root.
+ */
+export const devAgentHint = ({
+  command,
+  options = {},
+  config,
+  isAgent,
+  compose,
+}) => {
+  if ([].concat(command ?? []).join(' ') !== 'dev') return null
+  if (options.help || options.h) return null
+  if (options.detach || options['dry-run'] || options['session-process']) {
+    return null
+  }
+  if (options.sandbox !== undefined) return null
+  if (options.mode === 'agents' || options.mode === 'sandboxes') return null
+  const count = (value) => Object.keys(value ?? {}).length
+  // The MCP servers under `mcp.servers` are functions too: the MCP plugin adds them later.
+  const functionCount = count(config?.functions) + count(config?.mcp?.servers)
+  // Web apps run in functions mode, which a configuration without functions gets with
+  // --mode functions, or when it has no agents and no sandboxes (as the dev plugin detects the
+  // mode).
+  const webAppCount = count(config?.webApps)
+  const runsFunctionsMode =
+    functionCount > 0 ||
+    (webAppCount > 0 &&
+      (options.mode === 'functions' ||
+        (count(config?.ai?.agents) === 0 && count(config?.sandboxes) === 0)))
+  if (!runsFunctionsMode) return null
+  if (!isAgent()) return null
+  return agentHint(
+    composeServiceOf({ compose }),
+    configOf({ compose }, options),
+    { functions: functionCount > 0, webApps: webAppCount > 0 },
+  )
+}
+
+export class TraditionalRunner extends Runner {
+  constructor({
+    versionFramework,
+    command,
+    options,
+    config,
+    configFilePath,
+    stage,
+    resolverManager,
+    compose,
+  }) {
+    super({
+      versionFramework,
+      command,
+      options,
+      config,
+      configFilePath,
+      stage,
+      resolverManager,
+      compose,
+    })
+  }
+
+  static configFileNames = ['serverless']
+  static runnerType = 'traditional'
+
+  static async shouldRun({ config }) {
+    return !!config.service
+  }
+
+  static async customConfigFilePath({ options }) {
+    return options.config || options.c
+  }
+
+  serviceUniqueId
+  awsCfStack
+  integrations
+  compiledCloudFormationTemplate
+  coreCloudFormationTemplate
+  getAwsDeploymentCredentials
+
+  /**
+   * Help for a built-in command, answered before sign-in, so someone who has
+   * not signed in yet (often an agent) can still read what a command does.
+   *
+   * It is rendered from the Framework's static command schema and returns
+   * before anything the product does: no variable resolution, no plugin
+   * loading, nothing written to disk. The only call out is the one sign-in
+   * check detection cannot make locally: a License Key in SSM, looked up the
+   * way authenticate() looks it up (same AWS credential chain, no timeout).
+   * Everything else keeps the usual path, and the gate with it:
+   * - a signed-in user (or an env key) gets today's help, which includes the
+   *   commands and options the service's plugins add;
+   * - a command the static schema does not know -- a plugin command or a
+   *   typo -- goes through the runner, so plugin code never runs signed out;
+   * - without --help/-h (or the `help` command) nothing here applies.
+   *
+   * Returns true when help was printed.
+   */
+  async renderHelpBeforeAuth({
+    detectAuth = detectServerlessAuth,
+    findSsmLicenseKey = () =>
+      new Authentication({
+        versionFramework: this.versionFramework,
+      }).fetchLicenseKeyFromSSM({
+        logger: log.get('core:help'),
+        options: this.options,
+        resolverManager: this.resolverManager,
+      }),
+  } = {}) {
+    const { command, options } = this
+    const helpFlag = Boolean(options.help || options.h)
+    // `dev replay <requestId> --help` is help for `dev replay`: the positional words a command
+    // declares are left out (on a copy; the command itself is prepared later).
+    const commandName = movePositionals(
+      [...command],
+      {},
+      frameworkCommandsSchema,
+    ).join(' ')
+    const general = command[0] === 'help' || (!command[0] && helpFlag)
+    const builtInCommand =
+      !general &&
+      helpFlag &&
+      Boolean(command[0]) &&
+      frameworkCommandsSchema.has(commandName)
+    if (!general && !builtInCommand) return false
+    if ((await detectAuth({ config: this.config })).state !== 'none') {
+      return false
+    }
+    // The one sign-in detection cannot see: a License Key in SSM. With one,
+    // the normal help runs, with the plugins' commands.
+    if (await findSsmLicenseKey()) return false
+
+    progress.get('main').remove()
+    if (general) {
+      renderGeneralHelp({
+        loadedPlugins: new Set(),
+        commandsSchema: frameworkCommandsSchema,
+        version: this.versionFramework,
+      })
+      if (hasPlugins(this.config)) {
+        writeText(
+          'Commands and options added by this service\'s plugins are listed once you sign in ("serverless login").',
+        )
+      }
+    } else {
+      renderCommandHelp({
+        commandName,
+        commandsSchema: frameworkCommandsSchema,
+      })
+    }
+    return true
+  }
+
+  async run() {
+    const logger = log.get('traditional')
+
+    configureLocalstackAWSEndpoint({
+      config: this.config,
+      stage: this.stage,
+    })
+
+    prepareFrameworkOptions(this.command, this.options)
+
+    // An agent learns the finite commands before anything can fail or wait on AWS.
+    const hint = devAgentHint({
+      command: this.command,
+      options: this.options,
+      config: this.config,
+      // An agent, unless a person taken for one set SLS_INTERACTIVE_SETUP_ENABLE.
+      isAgent: () => isAgentSession(),
+      compose: this.compose,
+    })
+    if (hint) logger.notice(hint)
+
+    // Authenticate
+    const authenticatedData = await this.resolveVariablesAndAuthenticate()
+
+    // Resolve the variables in the template file
+    await this.resolveVariables({ printResolvedVariables: true })
+
+    // Get the AWS deployment credential provider. The Dev Mode commands that read only the local
+    // session state need the region alone: no credentials, no account lookup.
+    const localDevCommand = readsOnlyLocalDevState(this.command)
+    const { region, resolveCredentials, credentialSource } = localDevCommand
+      ? await this.getAwsRegionWithoutCredentials()
+      : await this.getAwsCredentialProvider()
+
+    let serviceUniqueId = localDevCommand
+      ? null
+      : (
+          await this.getServiceUniqueId().catch((err) => {
+            logger.debug('error getting service unique id', err)
+            return { serviceUniqueId: null }
+          })
+        )?.serviceUniqueId
+
+    // Captured pre-run so isFirstDeploy can distinguish create vs update —
+    // awsCfStack.timeUpdated is unreliable for this (still null on the 2nd
+    // deploy, since stack info is snapshotted before the update runs)
+    this.analyticsMetrics = metricsBeforeRun({
+      command: this.command,
+      serviceUniqueId,
+    })
+
+    // Run the command
+    const {
+      state,
+      integrations,
+      compiledCloudFormationTemplate,
+      coreCloudFormationTemplate,
+      analyticsMetrics,
+      exitCode,
+      exitReason,
+    } = await runFramework({
+      accessKeyV1: authenticatedData.accessKeyV1,
+      accessKeyV2: authenticatedData.accessKeyV2,
+      version: this.versionFramework,
+      service: this.config,
+      command: this.command,
+      options: this.options,
+      stage: this.stage,
+      servicePath: path.dirname(this.configFilePath),
+      serviceConfigFileName: path.parse(this.configFilePath).name,
+      serviceProviderAwsProvider: resolveCredentials,
+      serviceProviderAwsRegion: region,
+      serviceProviderAwsCredentialSource: credentialSource,
+      orgName: authenticatedData.orgName,
+      orgId: authenticatedData.orgId,
+      resolversManager: this.resolverManager,
+      composeServiceParams: this.compose?.serviceParams,
+      isWithinCompose: this.compose?.isWithinCompose,
+      composeServiceName: this.compose?.serviceName,
+      composeConfigFile: this.compose?.configFile,
+      composeOrgName: this.compose?.orgName,
+    })
+
+    this.integrations = integrations
+    this.compiledCloudFormationTemplate = compiledCloudFormationTemplate
+    this.coreCloudFormationTemplate = coreCloudFormationTemplate
+    Object.assign(this.analyticsMetrics, analyticsMetrics)
+
+    if (!serviceUniqueId && !localDevCommand) {
+      serviceUniqueId = (
+        await this.getServiceUniqueId().catch((err) => {
+          logger.debug('error getting service unique id', err)
+          return { serviceUniqueId: null }
+        })
+      )?.serviceUniqueId
+    }
+
+    return {
+      authenticatedData,
+      state,
+      serviceUniqueId,
+      // A command that ended with a non-zero code without throwing (Dev Mode's exit 3), and why,
+      // as a CLI error code when the command gave one.
+      ...(exitCode && { exitCode }),
+      ...(exitCode && exitReason && { exitReason }),
+    }
+  }
+
+  /** Where the service's AWS credentials come from, for both steps of the credential lookup. */
+  awsCredentialSource() {
+    return {
+      awsProfile: resolveServiceAwsProfile({
+        options: this.options,
+        config: this.config,
+      }),
+      providerAwsAccessKeyId:
+        this.authenticatedData?.dashboard?.serviceProvider?.accessKeyId,
+      providerAwsSecretAccessKey:
+        this.authenticatedData?.dashboard?.serviceProvider?.secretAccessKey,
+      providerAwsSessionToken:
+        this.authenticatedData?.dashboard?.serviceProvider?.sessionToken,
+      resolversManager: this.resolverManager,
+    }
+  }
+
+  async getAwsCredentialProvider() {
+    const { region, resolveCredentials, credentialSource } =
+      await getAwsCredentialProvider(this.awsCredentialSource())
+    this.getAwsDeploymentCredentials = resolveCredentials
+    return { region, resolveCredentials, credentialSource }
+  }
+
+  /**
+   * The region `getAwsCredentialProvider` reads, without reading the credentials or calling AWS:
+   * for the Dev Mode commands that read only the local session state. Their credential provider
+   * fails if anything asks it, and `getAwsDeploymentCredentials` stays unset.
+   */
+  async getAwsRegionWithoutCredentials() {
+    const { region, credentialSource } = await prepareAwsCredentialResolver(
+      this.awsCredentialSource(),
+    )
+    const command = [].concat(this.command ?? []).join(' ')
+    return {
+      region,
+      credentialSource,
+      resolveCredentials: async () => {
+        throw new ServerlessError(
+          `"serverless ${command}" reads only the local Dev Mode session and does not use AWS credentials.`,
+          'DEV_MODE_LOCAL_COMMAND_NO_AWS',
+          { stack: false },
+        )
+      },
+    }
+  }
+
+  async getServiceUniqueId() {
+    if (!this.authenticatedData) {
+      await this.resolveVariablesAndAuthenticate()
+    }
+    await this.resolveVariables()
+    if (!this.getAwsDeploymentCredentials) {
+      await this.getAwsCredentialProvider()
+    }
+    const credentials = this.getAwsDeploymentCredentials
+      ? await this.getAwsDeploymentCredentials()
+      : null
+
+    const p = progress.get('resolve-service-unique-id')
+    p.notice('Loading service details')
+
+    try {
+      const stackName = getStackName({
+        config: this.config,
+        stage: this.stage,
+      })
+
+      const { stackId, timeCreated, timeUpdated, status, outputs } =
+        await getStackInfo({
+          stackName,
+          region: credentials?.region,
+          credentials,
+        })
+
+      if (!stackId) {
+        const error = new Error(`Stack ${stackName} does not exist`)
+        // Sentinel consumed by compose's get-state pass (compose/state.js) to
+        // distinguish "not deployed yet" from real failures.
+        error.code = 'STACK_DOES_NOT_EXIST'
+        throw error
+      }
+
+      this.serviceUniqueId = stackId
+      this.awsCfStack = {
+        stackId,
+        stackName,
+        timeCreated,
+        timeUpdated,
+        status,
+        outputs,
+      }
+      return { serviceUniqueId: stackId }
+    } finally {
+      p.remove()
+    }
+  }
+
+  async getUsageEventDetails() {
+    const credentials = this.getAwsDeploymentCredentials
+      ? await this.getAwsDeploymentCredentials()
+      : null
+
+    return {
+      service: {
+        awsAccountId: credentials?.accountId || null,
+        serviceName: this.config?.service || null,
+        regionName: this.config?.provider?.region || null,
+        stageName: this.stage || null,
+        appName: this.config?.app || null,
+      },
+      awsCfStack: {
+        awsCfStackId: this.awsCfStack?.stackId,
+        timeCreated: this.awsCfStack?.timeCreated,
+        timeUpdated: this.awsCfStack?.timeUpdated,
+      },
+    }
+  }
+
+  /** The command as usage reports name it: without the positional values it was given. */
+  getEventCommand(command) {
+    return frameworkCommandWithoutPositionals({
+      command,
+      commandsSchema: frameworkCommandsSchema,
+    })
+  }
+
+  getAnalysisEventDetails() {
+    // Handler and entry paths are relative to the service directory, the
+    // config file's directory.
+    const serviceDir = this.configFilePath && path.dirname(this.configFilePath)
+    const details = {
+      providerRuntime: this.config.provider?.runtime,
+      awsCfStackId: this.serviceUniqueId,
+      // WillEsBuildRun reads functions and webApps; a throw escaping this
+      // method would drop the billing usage event.
+      isEsbuildEnabled: (() => {
+        try {
+          return Esbuild.WillEsBuildRun(this.config, serviceDir)
+        } catch {
+          return false
+        }
+      })(),
+      integrations: this.integrations,
+      // Service-shape and build metrics; deriveAnalysisEnrichment is total
+      // (never throws) — a throw escaping this method aborts finalization
+      // and silently drops the billing usage event
+      ...deriveAnalysisEnrichment({
+        config: this.config,
+        compiledCloudFormationTemplate: this.compiledCloudFormationTemplate,
+        command: this.command,
+        serviceUniqueId: this.serviceUniqueId,
+        analyticsMetrics: this.analyticsMetrics,
+      }),
+      // Sandboxes config-shape block. buildSandboxesAnalytics reads
+      // config.sandboxes internally under its own guard and is total (never
+      // throws), so it spreads in like deriveAnalysisEnrichment: `{}` when the
+      // service defines no sandboxes, `{ sandboxes: <block> }` otherwise.
+      ...buildSandboxesAnalytics(this.config),
+      // MCP config-shape block, same contract as the sandboxes one:
+      // buildMcpAnalytics reads config.mcp/config.provider under its own
+      // guard and is total (never throws) — `{}` when the service defines no
+      // MCP servers, `{ mcp: <block> }` otherwise.
+      ...buildMcpAnalytics(this.config),
+      // Provisioned-mode (provisionedPollers) config-shape block, same
+      // contract as the sandboxes/mcp ones: total (never throws), `{}` when
+      // no event uses the key, `{ provisionedPollers: <block> }` otherwise.
+      ...buildProvisionedPollersAnalytics(this.config),
+      // Web apps config-shape block, same contract as the sandboxes/mcp ones:
+      // total (never throws), `{}` when the service defines no web apps,
+      // `{ webApps: <block> }` otherwise. The service directory lets it apply
+      // esbuild's selection rules to each web app's entry.
+      ...buildWebAppsAnalytics(this.config, serviceDir),
+    }
+
+    // plugins
+    if (
+      Array.isArray(this.config?.plugins) ||
+      (Array.isArray(this.config?.plugins?.modules) && // If plugins is an object, it must have a modules array
+        (!this.config?.plugins?.localPath || // localPath is optional but if it exists, it must be a string
+          typeof this.config?.plugins?.localPath === 'string'))
+    ) {
+      details.plugins = this.config.plugins
+    }
+
+    // runtimes — explicit per-function runtimes, plus the value "image" for
+    // container-image functions (which do not set `runtime`). Total: a throw
+    // while reading a function must not abort the analysis event.
+    try {
+      const functionRuntimes = Object.values(this.config?.functions || {})
+        .map((functionObject) => {
+          if (functionObject?.image) return 'image'
+          return functionObject?.runtime || undefined
+        })
+        .filter((runtime) => runtime !== undefined)
+      if (functionRuntimes.length > 0) {
+        details.runtimes = Array.from(new Set(functionRuntimes))
+      }
+    } catch {
+      // leave `runtimes` unset
+    }
+
+    return details
+  }
+
+  async getDeploymentEventDetails() {
+    if (
+      isDashboardEnabledForService(this.config) &&
+      (this.command[0] === 'deploy' || this.command[0] === 'remove')
+    ) {
+      const credentials = this.getAwsDeploymentCredentials
+        ? await this.getAwsDeploymentCredentials()
+        : null
+
+      return createServiceDeployment({
+        service: this.config,
+        stage: this.stage,
+        areProvidersUsed: !!this.authenticatedData?.dashboard?.serviceProvider,
+        serviceAppId: this.authenticatedData?.dashboard?.serviceAppId,
+        awsAccountId: credentials?.accountId,
+        awsRegion: credentials?.region,
+        awsCfStackId: this.awsCfStack?.stackId,
+        awsCfStackCreated: this.awsCfStack?.timeCreated,
+        awsCfStackUpdated: this.awsCfStack?.timeUpdated,
+        awsCfStackStatus: this.awsCfStack?.status,
+        awsCfStackOutputs: this.awsCfStack?.outputs,
+      })
+    }
+  }
+
+  async getMetadataToSave() {
+    // Best effort: commands that need no AWS access (print, invoke local)
+    // still save their metadata when the account cannot be resolved. The
+    // resolver of a failed account lookup throws synchronously.
+    let credentials = null
+    try {
+      credentials = this.getAwsDeploymentCredentials
+        ? await this.getAwsDeploymentCredentials()
+        : null
+    } catch (err) {
+      log
+        .get('core:runner:metadata')
+        .debug('error resolving AWS account for metadata', err)
+    }
+
+    return {
+      serviceProviderAwsAccountId: credentials?.accountId,
+      serviceProviderAwsCfStackName: this.awsCfStack?.stackName,
+      serviceProviderAwsCfStackId: this.awsCfStack?.stackId,
+      serviceProviderAwsCfStackCreated: this.awsCfStack?.timeCreated,
+      serviceProviderAwsCfStackUpdated: this.awsCfStack?.timeUpdated,
+      serviceProviderAwsCfStackStatus: this.awsCfStack?.status,
+      serviceProviderAwsCfStackOutputs: this.awsCfStack?.outputs,
+      compiledCloudFormationTemplate: this.compiledCloudFormationTemplate,
+      coreCloudFormationTemplate: this.coreCloudFormationTemplate,
+    }
+  }
+}
+
+const isDashboardEnabledForService = (config) => {
+  return (
+    config?.org &&
+    typeof config?.org === 'string' &&
+    config?.app &&
+    typeof config?.app === 'string' &&
+    config?.service &&
+    typeof config?.service === 'string'
+  )
+}
+
+const runFramework = async ({
+  service,
+  options,
+  stage,
+  servicePath,
+  serviceProviderAwsProvider,
+  serviceProviderAwsRegion,
+  serviceProviderAwsCredentialSource,
+  composeServiceParams,
+  isWithinCompose,
+  composeServiceName,
+  composeConfigFile,
+  composeOrgName,
+  command,
+  accessKeyV1,
+  accessKeyV2,
+  orgName,
+  orgId,
+  serviceConfigFileName,
+  version,
+  resolversManager,
+}) => {
+  const logger = log.get('core:runner:sls')
+  let state
+  logger.debug({
+    service: summarizeServiceForLog(service),
+    options,
+    stage,
+    servicePath,
+    serviceProviderAwsProvider,
+    serviceProviderAwsRegion,
+    composeServiceParams,
+    isWithinCompose,
+    composeOrgName,
+    command,
+    accessKey: maskKeyForLog(accessKeyV1),
+    licenseKey: maskKeyForLog(accessKeyV2),
+    orgName,
+    orgId,
+    serviceConfigFileName,
+  })
+
+  /**
+   * Check to see if the Service exists
+   */
+  if (!service) {
+    const err = new ServerlessError(
+      `No Service configuration file (e.g. serverless.yml) was found in "${servicePath}"`,
+      ServerlessErrorCodes.framework.FRAMEWORK_CONFIG_NOT_FOUND,
+    )
+    err.stack = undefined
+    throw err
+  }
+
+  /**
+   * Ensure "provider" is an object.
+   * Ensure "provider.name" is "aws".
+   * Ensure "provider.name" is not a Serverless Framework Variable.
+   */
+  if (!_.isObject(service.provider)) {
+    service.provider = { name: 'aws' }
+  }
+  if (service.provider.name !== 'aws') {
+    if (service.provider?.name?.startsWith('${')) {
+      const err = new ServerlessError(
+        'Serverless Framework Variables are not supported for "provider.name".',
+        ServerlessErrorCodes.framework
+          .FRAMEWORK_VARIABLES_NOT_SUPPORTED_FOR_PROVIDER,
+      )
+      err.stack = undefined
+      throw err
+    } else {
+      const err = new ServerlessError(
+        'Serverless Framework V.4 only supports "aws" as a Provider. Please look into Extensions for a better multi-Provider experience.',
+        ServerlessErrorCodes.framework.FRAMEWORK_UNSUPPORTED_PROVIDER,
+      )
+      err.stack = undefined
+      throw err
+    }
+  }
+
+  /**
+   * Serverless Framework Variable Resolution does not overwrite
+   * the "stage" if provided via options. However, the Framework later
+   * DOES overwrite anything in the config with the "stage" option.
+   * This overwriting is still in the Framework, but let's also
+   * resolve it here.
+   *
+   * This shouldn't affect fallback variables, since the
+   * stage option is not added unless it exists.
+   */
+  service.provider.stage = stage
+
+  /**
+   * Remove Service "params" for other stages than the current one
+   * or "default" from serverless.yml. This prevents the Framework
+   * from trying to resolve variables that are not available.
+   * https://github.com/serverless/serverless/issues/12086
+   */
+  if (service.params) {
+    for (const [key] of Object.entries(service.params)) {
+      if (key !== stage && key !== 'default') {
+        delete service.params[key]
+      }
+    }
+  }
+
+  /**
+   * Serverless Framework might be running within a broader Compose
+   * operation. If an "org" is defined within the Compose config,
+   * then we need to ensure that the "org" is set within the Service,
+   * and that it matches the Compose "org" name.
+   * This is the ideal time to do this, since we have the "org" value.
+   */
+  if (isWithinCompose) {
+    if (command[0] === 'remove') {
+      service.configValidationMode = 'off'
+    }
+    // Ensure "org" is set within the Compose file, if it's set within the Service
+    if (!composeOrgName && service.org) {
+      // Suppress configuration schema errors when running the 'remove' command within Compose
+      // because the Compose service parameters are not available during the 'remove' command
+      // as there's no Compose service to resolve them from
+      const err = new ServerlessError(
+        'Your Service has an "org" property, but the Compose config does not. Please ensure that the "org" property is set within the Compose config and it matches all Services run with Compose.',
+        ServerlessErrorCodes.compose.COMPOSE_ORG_PROPERTY_MISSING,
+      )
+      err.stack = undefined
+      throw err
+    }
+    // If "org" is set within the Compose file, ensure it matches the Service
+    if (composeOrgName && service.org && composeOrgName !== service.org) {
+      const err = new ServerlessError(
+        'The "org" defined in the Service does not match the "org" used in your Compose operation.\n\nYou may have a different "org" specified in your Compose configuration file, or you may have a default Org on your machine that does not match the one in this Service, or you may authenticated with a user or license key associated with a different Org.\n\nTo resolve this, ensure that the "org" property is set within the Compose config and it matches all Services run with Compose.',
+        ServerlessErrorCodes.framework.MISMATCHED_COMPOSE_FRAMEWORK_ORG,
+      )
+      err.stack = undefined
+      throw err
+    }
+    // Otherwise, set the "org" within the Service to match the Compose file
+    if (composeOrgName && !service.org) {
+      service.org = composeOrgName
+    }
+  }
+
+  // Assign resolved params to unresolved composeServiceParams
+  Object.keys(composeServiceParams || {}).forEach((key) => {
+    if (resolversManager.composeParams[key] !== undefined) {
+      composeServiceParams[key] = resolversManager.composeParams[key]
+    }
+  })
+
+  const serverless = new Serverless({
+    version,
+    orgId,
+    orgName,
+    accessKey: accessKeyV1 || accessKeyV2,
+    servicePath,
+    serviceConfigFileName,
+    service,
+    commands: command,
+    options,
+    credentialProviders: { aws: serviceProviderAwsProvider },
+    region: serviceProviderAwsRegion,
+    // Where the AWS credentials come from, for advice when AWS rejects them (Dev Mode reads it).
+    awsCredentialSource: serviceProviderAwsCredentialSource,
+    compose: {
+      serviceParams: composeServiceParams,
+      isWithinCompose,
+      serviceName: composeServiceName,
+      configFile: composeConfigFile,
+    },
+    instanceId: await resolversManager.resolveVariableOnce('sls:instanceId'),
+  })
+
+  await serverless.init()
+
+  await resolvePluginVariables(
+    resolversManager,
+    serverless.pluginManager?.externalPlugins,
+  )
+
+  /**
+   * Resolve the full command schema
+   *
+   * If Plugins are loaded, update the commands schema to include any
+   * that plugins may have added. Also, get a specific command schema.
+   */
+  const fullCommand = command.join(' ')
+
+  let resolvedCommandsSchema = frameworkCommandsSchema
+
+  if (serverless.pluginManager.externalPlugins.size) {
+    resolvedCommandsSchema = resolveInputFinal(
+      serverless.pluginManager.externalPlugins,
+      { providerName: service.provider.name },
+    )
+  }
+
+  const resolvedCommandSchema = resolvedCommandsSchema.get(fullCommand)
+
+  convertOptionShortcutsToFullNames(
+    options,
+    resolvedCommandSchema,
+    resolvedCommandsSchema,
+  )
+
+  serverless.processedInput.commands = serverless.pluginManager.cliCommands =
+    command
+  serverless.processedInput.options = options
+  Object.assign(serverless.pluginManager.cliOptions, options)
+
+  if (
+    renderHelpCommand(
+      command,
+      options,
+      serverless,
+      resolvedCommandsSchema,
+      version,
+    )
+  ) {
+    return {}
+  }
+
+  ensureSupportedCommand({
+    command: fullCommand,
+    options,
+    commandSchema: resolvedCommandSchema,
+    commandsSchema: resolvedCommandsSchema,
+  })
+
+  await serverless.run()
+
+  state = buildCommandState({
+    stackOutputs: serverless.stackOutputs,
+    fullCommand,
+  })
+
+  const analyticsMetrics = {}
+  const lifecycleEventDurations =
+    serverless.pluginManager?.lifecycleEventDurations ?? {}
+  const buildDurationMs =
+    (lifecycleEventDurations['package:createDeploymentArtifacts'] ?? 0) +
+    (lifecycleEventDurations['deploy:function:packageFunction'] ?? 0)
+  if (buildDurationMs > 0) {
+    analyticsMetrics.buildDurationMs = buildDurationMs
+  }
+
+  // Only packaging commands produce artifacts; other commands (e.g. info)
+  // may still carry a pre-configured package.artifact path, which is not an
+  // output of this run
+  if (['package', 'deploy', 'deploy function'].includes(fullCommand)) {
+    try {
+      // Classic individually-packaged artifacts are recorded relative to the
+      // service dir; resolve and dedupe before stat
+      const artifactPaths = [
+        ...new Set(
+          collectArtifactPaths(serverless.service).map((artifactPath) =>
+            path.resolve(servicePath, artifactPath),
+          ),
+        ),
+      ]
+      const artifactSizesBytes = []
+      for (const artifactPath of artifactPaths) {
+        try {
+          artifactSizesBytes.push((await stat(artifactPath)).size)
+        } catch (err) {
+          // e.g. a disabled function whose configured artifact was never
+          // written — skip it and keep the sizes of the artifacts that exist
+          logger.debug(`error reading artifact size for ${artifactPath}`, err)
+        }
+      }
+      if (artifactSizesBytes.length > 0) {
+        analyticsMetrics.artifactSizesBytes = artifactSizesBytes
+      }
+    } catch (err) {
+      logger.debug('error collecting artifact sizes', err)
+    }
+  }
+
+  return {
+    state,
+    integrations: serverless.integrations,
+    compiledCloudFormationTemplate:
+      serverless.service?.provider?.compiledCloudFormationTemplate,
+    coreCloudFormationTemplate:
+      serverless.service?.provider?.coreCloudFormationTemplate,
+    analyticsMetrics,
+    exitCode: serverless.exitCode,
+    exitReason: serverless.exitReason,
+  }
+}
+
+const hasPlugins = (config) => {
+  const plugins = config?.plugins
+  const modules = Array.isArray(plugins) ? plugins : plugins?.modules
+  return Array.isArray(modules) && modules.length > 0
+}
+
+/**
+ * Render Help Command
+ *
+ * @param {Object} command - The command object.
+ * @param {Object} options - The options object.
+ * @param {Object} serverless - The serverless instance.
+ * @param {Object} resolvedCommandsSchema - The resolved commands schema.
+ * @param {string} version - The version of the Serverless Framework.
+ */
+function renderHelpCommand(
+  command,
+  options,
+  serverless,
+  resolvedCommandsSchema,
+  version,
+) {
+  if (command[0] === 'help' || (!command[0] && (options.help || options.h))) {
+    renderGeneralHelp({
+      loadedPlugins: serverless.pluginManager.externalPlugins,
+      commandsSchema: resolvedCommandsSchema,
+      version,
+    })
+    return true
+  } else if (
+    command[0] &&
+    command[0] !== 'help' &&
+    (options.help || options.h)
+  ) {
+    renderCommandHelp({
+      commandName: command.join(' '),
+      commandsSchema: resolvedCommandsSchema,
+    })
+    return true
+  }
+  return false
+}
+
+/**
+ * Registers the resolver providers from the external plugins and resolves the placeholders in the config.
+ *
+ * @param {Object} resolversManager - The resolver manager.
+ * @param {Set} plugins - The array of external plugins.
+ * @throws {ServerlessError} If the resolver manager is not found.
+ * @returns {Promise} A promise that resolves when placeholders in the config have been replaced.
+ */
+const resolvePluginVariables = async (resolversManager, plugins) => {
+  if (!resolversManager) {
+    throw new ServerlessError(
+      'Resolver Manager not found.',
+      ServerlessErrorCodes.framework.RESOLVER_MANAGER_NOT_FOUND,
+    )
+  }
+  if (!plugins) {
+    return
+  }
+  plugins.forEach((plugin) => {
+    for (const source in plugin.configurationVariablesSources) {
+      const resolverProvider = convertPluginToResolverProvider(
+        plugin.constructor?.name,
+        source,
+        plugin.configurationVariablesSources[source].resolve,
+      )
+      providerRegistry.register(source, resolverProvider)
+    }
+  })
+  // Resolve all placeholders in the config
+  // using the registered resolver providers from the external plugins
+  await resolversManager.resolveAndReplacePlaceholdersInConfig()
+  // Plugins can add new configuration properties or modify existing ones using the "serverless.extendConfiguration" method.
+  // The placeholders in the new or modified configuration properties need to be resolved
+  // after the placeholders in the original configuration have been resolved.
+  await resolversManager.loadPlaceholders()
+  await resolversManager.resolveAndReplacePlaceholdersInConfig()
+}
+
+const getStackName = ({ config, stage }) => {
+  if (
+    config?.provider?.stackName &&
+    typeof config.provider.stackName === 'string'
+  ) {
+    return config.provider.stackName
+  }
+  return `${config.service}-${stage}`
+}
+
+const getStackInfo = async ({ stackName, region, credentials }) => {
+  const awsCloudformation = new AwsCloudformationService({
+    region,
+    credentials,
+  })
+  const awsStackInfo = await awsCloudformation.describeStack(stackName)
+  return {
+    stackId: awsStackInfo?.StackId,
+    stackName: awsStackInfo?.StackName,
+    timeCreated: awsStackInfo?.CreationTime?.toISOString(),
+    timeUpdated: awsStackInfo?.LastUpdatedTime?.toISOString(),
+    status: awsStackInfo?.StackStatus,
+    outputs: awsStackInfo?.Outputs,
+  }
+}
+
+/**
+ * Prepare the options of a Framework command before anything reads them: Dev Mode's repeatable
+ * function selectors become lists, then shortcuts are mapped to full option names. This runs with
+ * the command that actually runs, after Compose removed any service name, for Compose and plain
+ * services alike. Positional words a command declares become options first (`movePositionals`).
+ *
+ * @param {string[]} command - The command words, without a Compose service name.
+ * @param {Object} options - The options object, changed in place.
+ * @returns {Object} The same options object.
+ */
+export const prepareFrameworkOptions = (command, options) => {
+  // `dev replay <requestId>`: declared positional words become options, so the command that runs
+  // and the command usage reports name is the schema's.
+  movePositionals(command, options, frameworkCommandsSchema)
+  normalizeDevSelectors(command, options)
+  convertOptionShortcutsToFullNames(
+    options,
+    frameworkCommandsSchema.get(command.join(' ')),
+    frameworkCommandsSchema,
+  )
+  return options
+}
+
+/**
+ * Convert Option shortcuts/aliases to full Option names
+ *
+ * Look at the Command Schema to map shortcuts to full names.
+ * If not found, look at the Common Options Schema, which declares
+ * global options that are available to all commands, and try
+ * to map those shortcuts to a full name.
+ *
+ * @param {Object} options - The options object.
+ * @param {Object} resolvedCommandSchema - The resolved command schema.
+ * @param {Object} resolvedCommandsSchema - The resolved commands schema.
+ */
+function convertOptionShortcutsToFullNames(
+  options,
+  resolvedCommandSchema,
+  resolvedCommandsSchema,
+) {
+  if (!options) return
+  /**
+   * Look at the Command Schema to map shortcuts to full names.
+   * If not found, look at the Common Options Schema, which declares
+   * global options that are available to all commands, and try
+   * to map those shortcuts to a full name.
+   */
+  for (const [optionName] of Object.entries(options)) {
+    if (resolvedCommandSchema) {
+      // Loop over the commandSchema.options to check if the option name matches a shortcut
+      for (const [schemaOptionName, schemaOptionDetails] of Object.entries(
+        resolvedCommandSchema.options,
+      )) {
+        if (schemaOptionDetails.shortcut === optionName) {
+          options[schemaOptionName] = options[optionName]
+          delete options[optionName]
+          break // Exit the loop early as we've found a matching shortcut
+        }
+      }
+    }
+    // Do the same for common options
+    if (resolvedCommandsSchema.commonOptions) {
+      for (const [schemaOptionName, schemaOptionDetails] of Object.entries(
+        resolvedCommandsSchema.commonOptions,
+      )) {
+        if (
+          schemaOptionDetails.shortcut === optionName &&
+          // Ensure the option hasn't already been set by the command schema
+          options[optionName] !== undefined
+        ) {
+          options[schemaOptionName] = options[optionName]
+          delete options[optionName]
+          break // Exit the loop early as we've found a matching shortcut
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Create a service deployment object
+ */
+const createServiceDeployment = ({
+  service,
+  stage,
+  areProvidersUsed,
+  serviceAppId,
+  awsAccountId,
+  awsRegion,
+  awsCfStackId,
+  awsCfStackCreated,
+  awsCfStackUpdated,
+  awsCfStackStatus,
+  awsCfStackOutputs,
+}) => {
+  const logger = log.get('core:platform:deployments')
+  logger.debug('creating service deployment record for the serverless platform')
+
+  // Create deployment instance
+  const deploymentInstance = new Deployment()
+
+  /**
+   * Set & Save Initial Deployment Data
+   */
+  const deployment = {}
+  deployment.appUid = serviceAppId || null
+  deployment.appName = service?.app || null
+  deployment.serviceName = service?.service || null
+  deployment.stageName = stage || null
+  deployment.regionName = awsRegion || null
+  deployment.logsRoleArn = null
+  deployment.provider = {}
+  deployment.provider.type = service?.provider?.name
+  if (deployment.provider.type === 'aws') {
+    deployment.provider.aws = {}
+    deployment.provider.aws.accountId = awsAccountId
+  }
+  deployment.layers = service?.layers || {}
+  deployment.plugins = service?.plugins
+    ? service?.plugins?.modules || service?.plugins
+    : []
+  deployment.custom = service?.custom || {}
+  deployment.areProvidersUsed = areProvidersUsed
+
+  if (awsCfStackId) {
+    deployment.awsCfStack = {
+      awsCfStackId: awsCfStackId,
+      timeCreated: awsCfStackCreated,
+      timeUpdated: awsCfStackUpdated,
+      stackStatus: awsCfStackStatus,
+    }
+  }
+
+  // Save initial data to deployment instance
+  deploymentInstance.set(deployment)
+
+  /**
+   * Save Functions & Subscriptions (Events) to Deployment
+   */
+  for (const fnName of Object.keys(service.functions || {})) {
+    const fn = service.functions[fnName]
+    const deployedFunctionName =
+      fn.name || `${service.service}-${stage}-${fnName}`
+    fn.events = fn.events || []
+
+    // Function
+    deploymentInstance.setFunction({
+      name: deployedFunctionName,
+      description: fn.description || null,
+      timeout: fn.timeout,
+      type: 'awsLambda',
+      arn: `arn:aws:lambda:${service.provider.region}:${awsAccountId}:function:${deployedFunctionName}`,
+      custom: {
+        handler: fn.handler,
+        memorySize: fn.memory,
+        runtime: fn.runtime,
+        environment: Object.keys(fn.environment || {}),
+        role: fn.role,
+        onError: fn.onError,
+        awsKmsKeyArn: fn.awsKmsKeyArn,
+        tags: fn.tags || {},
+        vpc: fn.vpc || {},
+        layers: fn.layers || [],
+        name: fn.name || fnName,
+      },
+    })
+
+    /*
+     * Add this functions's subscriptions...
+     */
+    for (const sub of fn.events) {
+      let subDetails = {}
+      let type
+      if (typeof sub === 'string') {
+        type = sub
+      } else {
+        type = Object.keys(sub)[0]
+        if ((type === 'http' || type === 'httpApi') && awsCfStackOutputs) {
+          const apigResource = _.find(
+            awsCfStackOutputs,
+            ({ OutputKey }) =>
+              !OutputKey.endsWith('Websocket') &&
+              OutputKey.match(/^(ServiceEndpoint|HttpApiUrl)/),
+          )
+          const apiId =
+            apigResource &&
+            apigResource.OutputValue.split('https://')[1].split('.')[0]
+
+          if (typeof sub[type] === 'string') {
+            subDetails = {
+              path: sub[type].split(' ')[1],
+              method: sub[type].split(' ')[0],
+            }
+          } else {
+            subDetails = {
+              path: sub[type].path,
+              method: sub[type].method,
+              cors: sub[type].cors,
+              integration: sub[type].integration,
+              authorizer: sub[type].authorizer,
+              timeout: sub[type].timeout,
+            }
+          }
+          if (type === 'http') {
+            subDetails.restApiId = apiId
+          } else {
+            subDetails.httpApiId = apiId
+          }
+        } else if (sub[type] instanceof Object) {
+          Object.assign(subDetails, sub[type])
+        } else {
+          Object.assign(subDetails, { [type]: sub[type] })
+        }
+        if (type === 'websocket' && awsCfStackOutputs) {
+          const apigResource = _.find(
+            awsCfStackOutputs,
+            ({ OutputKey }) =>
+              OutputKey.endsWith('Websocket') &&
+              OutputKey.match(/^(ServiceEndpoint|HttpApiUrl)/),
+          )
+          const apiId =
+            apigResource &&
+            apigResource.OutputValue.split('wss://')[1].split('.')[0]
+          subDetails.websocketApiId = apiId
+        }
+      }
+      deploymentInstance.setSubscription({
+        type,
+        function: deployedFunctionName,
+        ...subDetails,
+      })
+    }
+  }
+
+  /**
+   * Save Outputs to Deployment
+   * Fetch any Cloudformation Outputs specified as Service Outputs
+   */
+  const outputs = { ...service.outputs }
+  for (const [outputKey, outputValue] of _.entries(outputs)) {
+    if (typeof outputValue === 'string' && outputValue.startsWith('CFN!?')) {
+      if (awsCfStackOutputs) {
+        const cfnOutput = _.find(
+          awsCfStackOutputs,
+          ({ OutputKey }) => OutputKey === `${outputValue.slice(5)}`,
+        )
+        outputs[outputKey] = cfnOutput.OutputValue
+      } else {
+        delete outputs[outputKey]
+      }
+    }
+  }
+  deploymentInstance.set({ outputs })
+
+  return deploymentInstance
+}
+
+const maskKeyForLog = (value) => {
+  if (typeof value !== 'string' || value.length === 0) {
+    return value ?? null
+  }
+  const trimmed = value.trim()
+  if (trimmed.length <= 8) {
+    return `${trimmed.slice(0, 2)}****${trimmed.slice(-2)}`
+  }
+  return `${trimmed.slice(0, 4)}****${trimmed.slice(-4)}`
+}
+
+const summarizeServiceForLog = (serviceConfig) => {
+  try {
+    if (!serviceConfig || typeof serviceConfig !== 'object') {
+      return serviceConfig ?? null
+    }
+    const summary = {
+      service: serviceConfig.service,
+      app: serviceConfig.app,
+      org: serviceConfig.org,
+      provider:
+        serviceConfig.provider && typeof serviceConfig.provider === 'object'
+          ? {
+              name: serviceConfig.provider.name,
+              runtime: serviceConfig.provider.runtime,
+              region: serviceConfig.provider.region,
+            }
+          : undefined,
+      frameworkVersion: serviceConfig.frameworkVersion,
+      functions:
+        serviceConfig.functions && typeof serviceConfig.functions === 'object'
+          ? Object.keys(serviceConfig.functions)
+          : undefined,
+      plugins: Array.isArray(serviceConfig.plugins)
+        ? serviceConfig.plugins.map((plugin) =>
+            typeof plugin === 'string' ? plugin : plugin?.name,
+          )
+        : undefined,
+      licenseKey: serviceConfig.licenseKey
+        ? maskKeyForLog(serviceConfig.licenseKey)
+        : undefined,
+      layers:
+        serviceConfig.layers && typeof serviceConfig.layers === 'object'
+          ? Object.keys(serviceConfig.layers)
+          : undefined,
+      params:
+        serviceConfig.params && typeof serviceConfig.params === 'object'
+          ? Object.entries(serviceConfig.params).reduce(
+              (acc, [stageName, stageParams]) => {
+                acc[stageName] =
+                  stageParams && typeof stageParams === 'object'
+                    ? Object.keys(stageParams)
+                    : stageParams
+                return acc
+              },
+              {},
+            )
+          : undefined,
+      custom:
+        serviceConfig.custom && typeof serviceConfig.custom === 'object'
+          ? Object.keys(serviceConfig.custom)
+          : undefined,
+      stages:
+        serviceConfig.stages && typeof serviceConfig.stages === 'object'
+          ? Object.entries(serviceConfig.stages).reduce(
+              (acc, [stageName, stageConfig]) => {
+                if (stageConfig && typeof stageConfig === 'object') {
+                  acc[stageName] = Object.entries(stageConfig).reduce(
+                    (stageAcc, [sectionName, sectionValue]) => {
+                      stageAcc[sectionName] =
+                        sectionValue && typeof sectionValue === 'object'
+                          ? Object.keys(sectionValue)
+                          : sectionValue
+                      return stageAcc
+                    },
+                    {},
+                  )
+                } else {
+                  acc[stageName] = stageConfig
+                }
+                return acc
+              },
+              {},
+            )
+          : undefined,
+    }
+    if (serviceConfig.package) {
+      const packageSummary = {}
+      if (serviceConfig.package.individually !== undefined) {
+        packageSummary.individually = Boolean(
+          serviceConfig.package.individually,
+        )
+      }
+      if (Array.isArray(serviceConfig.package.patterns)) {
+        packageSummary.patternsCount = serviceConfig.package.patterns.length
+      }
+      if (Array.isArray(serviceConfig.package.exclude)) {
+        packageSummary.excludeCount = serviceConfig.package.exclude.length
+      }
+      if (Array.isArray(serviceConfig.package.include)) {
+        packageSummary.includeCount = serviceConfig.package.include.length
+      }
+      if (Object.keys(packageSummary).length > 0) {
+        summary.package = packageSummary
+      }
+    }
+    if (serviceConfig.resources) {
+      if (Array.isArray(serviceConfig.resources)) {
+        summary.resources = { entries: serviceConfig.resources.length }
+      } else if (typeof serviceConfig.resources === 'object') {
+        summary.resources = Object.entries(serviceConfig.resources).reduce(
+          (acc, [sectionName, sectionValue]) => {
+            acc[sectionName] =
+              sectionValue && typeof sectionValue === 'object'
+                ? Object.keys(sectionValue)
+                : sectionValue
+            return acc
+          },
+          {},
+        )
+      }
+    }
+    if (serviceConfig.outputs) {
+      summary.outputs = Object.keys(serviceConfig.outputs)
+    }
+    return summary
+  } catch (error) {
+    return null
+  }
+}

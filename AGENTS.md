@@ -1,0 +1,179 @@
+# Serverless Framework
+
+Monorepo for the **Serverless Framework** - a command-line tool for deploying serverless applications to AWS Lambda and other managed cloud services, driven by YAML configuration (`serverless.yml`). Development uses Node.js 24 or 26 + npm 12 (ES Modules); the shipped CLI supports Node.js >= 18.
+
+## Repository Structure
+
+```text
+├── packages/
+│   ├── sf-core/                # CLI shell: entry point, command router, runners
+│   ├── serverless/             # Traditional framework: AWS provider, plugins, config schema
+│   ├── engine/                 # Shared AWS client wrappers used across the CLI
+│   ├── mcp/                    # MCP server for AI IDEs
+│   ├── util/                   # Shared utilities
+│   ├── standards/              # ESLint and Prettier configs
+│   ├── framework-dist/         # Bundled distribution package (excluded from npm workspaces)
+│   └── sf-core-installer/      # Published to npm as "serverless" (excluded from npm workspaces)
+├── binary-installer/           # Go-based binary installer
+├── dev-mode-bridge/            # Go Runtime API bridge + exec wrapper for the Dev Mode layer
+├── docs/sf/                    # User-facing documentation (published to serverless.com)
+├── skills/                     # Agent Skills shipped inside the CLI (CI-linted)
+└── release-scripts/            # Release automation
+```
+
+### Architecture
+
+- **`packages/sf-core`**: the CLI shell. `bin/sf-core.js` boots `src/lib/router.js`, which dispatches commands to runners in `src/lib/runners/`. Also hosts auth, variable resolvers, observability, and agent-skills logic.
+- **`packages/serverless`**: where most changes land — the AWS provider implementation, all plugins (`lib/plugins/aws/`, `lib/plugins/esbuild/`, ...), and the `serverless.yml` config schema (`lib/config-schema.js`, extended per plugin).
+- **`packages/framework-dist`** and **`packages/sf-core-installer`** are excluded from npm workspaces. `sf-core-installer` is what npm users install as `serverless`; its only dependency is `undici`, pinned to 6.x (the last line supporting Node.js 18; no transitive dependencies), and it has its own `.npmrc` — root-level dependency fixes never reach it.
+
+## Development Setup
+
+```bash
+# Install dependencies (npm ci never rewrites the lockfile; prefer it over npm install)
+npm ci
+
+# Run the framework locally on a test project
+cd /path/to/your/test-project
+node /path/to/serverless/packages/sf-core/bin/sf-core.js deploy
+```
+
+## Code Style
+
+### Formatting Rules
+
+- **No semicolons** - Prettier removes them
+- **Single quotes** for strings
+- **2-space indentation**
+- **LF line endings**
+- **ES Modules** - use `import`/`export`, not `require()`
+- Prefer native JavaScript over lodash; use async/await for asynchronous code
+- New examples, fixtures, and snippets use current vendor-recommended idioms (ESM `.mjs` handlers, latest runtimes, AWS SDK v3) — consistency with older repo content is not a reason for legacy style
+
+### Linting Commands
+
+```bash
+npm run prettier        # check formatting
+npm run prettier:fix    # fix formatting
+npm run lint            # run ESLint
+npm run lint:fix        # fix lint issues
+```
+
+Gotchas:
+
+- ESLint only lints the explicit path globs listed in `eslint.config.js` — a new package or top-level source directory is silently unlinted until added there.
+- The shared ESLint config (`packages/standards/src/eslint.js`) disables `no-unused-vars` and several other rules — lint will NOT catch unused variables or imports.
+- A husky pre-commit hook runs lint-staged (Prettier on staged JS/TS files), so formatting is partly automated at commit time; still run lint before pushing.
+- Exception to the ES Modules rule: `packages/sf-core-installer` is CommonJS.
+- `.env` files are deliberately NOT gitignored (test fixtures depend on them) — never write real credentials into one.
+
+## Dependencies
+
+- The shipped CLI supports Node.js 18 (`packages/serverless` declares `engines.node: ">=18.0"`). Runtime dependencies must keep Node 18 support even though development uses Node 24 or 26. Majors that drop Node 18 are blocked via the ignore list in `.github/dependabot.yml` — check it before bumping; dev-only dependencies may require any Node version.
+- Write `package-lock.json` only with npm 12. npm <= 11 silently drops root `overrides` in workspaces repos (npm/cli#4834). Use `npm ci` for plain installs.
+- `.npmrc` sets `min-release-age=3`: npm versions published less than 3 days ago won't resolve unless you pass `--min-release-age=0` explicitly.
+- Dependabot updates only the directories `.github/dependabot.yml` lists. A new package or test fixture with dependencies (a `package.json` that declares any, a requirements file, `Pipfile`, `poetry.lock`, `uv.lock`, `Dockerfile`, `go.mod`, `pom.xml` or a pinned Terraform provider) needs its directory in the entry for its package manager; `packages/sf-core/tests/unit/dependabot-coverage.test.js` fails until it is there and names the missing directory. A dependency that several npm directories declare goes in one of the groups listed first in the npm entry, which keep it at one version everywhere, or in that test's `MAY_DIFFER` with the reason its versions may differ.
+
+## Testing
+
+### Unit Tests (Run Locally)
+
+```bash
+npm run test:unit -w @serverlessinc/sf-core     # jest over packages/sf-core/tests/unit/
+npm run test:unit -w @serverless/framework      # jest over packages/serverless/test/unit/
+npm run test:unit -w @serverless/mcp            # jest over packages/mcp/tests/ (excluding tests/e2e/)
+npm test                                        # all three unit suites
+```
+
+Note the inconsistent directory naming: `tests/` in sf-core, `test/` in serverless — easy to misplace new tests.
+
+Always invoke Jest via the npm scripts, not bare `jest` — the scripts set `--experimental-vm-modules`, required for ESM.
+
+### Integration Tests (Live AWS)
+
+Integration tests deploy real AWS stacks. They run in CI on non-draft PRs and can be run locally given AWS credentials plus the prerequisite resources described in [TESTING.md](TESTING.md).
+
+```bash
+npm test -w @serverlessinc/sf-core              # integration suite (excludes domains, mcp and dev-mode)
+npm run test:<suite> -w @serverlessinc/sf-core  # targeted suite
+```
+
+Targeted suites include: `simple:nodejs`, `simple:python`, `simple:compose`, `simple:dashboard`, `simple:resolvers`, `resolvers`, `esbuild`, `sam`, `sandboxes`, `state`, `deployment-bucket`, `durable`, `license-key`, `domains`, `mcp`, `dev-mode`, `dev-mode:agent-loop`, `compose:dev`, `compose:subset`. Prefer the targeted suite covering the touched area. Three suites are excluded from `npm test`: `domains` (not run by any CI workflow — only when invoked explicitly), `mcp` (run by the path-filtered `CI: MCP Servers` workflow; only its `mcp-auth.test.js` suite needs the Cognito prerequisite from [TESTING.md](TESTING.md) — absent that, that suite skips while the rest runs) and `dev-mode` (run by the path-filtered `CI: Dev Mode` workflow on Linux, and its `agent-loop` file on Windows; creates an IAM role and layers under a test suffix and deletes them; run it with `npm run test:dev-mode -w @serverlessinc/sf-core` after `npm run build:devmode:layer -w @serverless/framework` and `npm run build:mcp:entry -w @serverless/framework`). Any other new directory under `tests/integration/` joins `npm test` automatically, so an expensive new suite has to opt out the same way. A new suite also needs an entry in `packages/sf-core/tests/integration/shards.json`, which a unit test enforces; see "CI Test Accounts" in [TESTING.md](TESTING.md).
+
+Conventions: each suite pairs `<name>.test.js` with a sibling `fixture/` directory holding the service under test — **one fixture directory per test file**, since jest parallelizes test files with no worker cap and two files deploying from one directory would race over `.serverless/`, `node_modules/` and any staged artifact; reuse the shared helpers in `packages/sf-core/tests/utils/` (`runSfCore.js`, `testUtils.js` — e.g. `fetchWithRetry` for eventually-consistent endpoints) rather than hand-rolling CLI invocation. Fixtures must not list legacy bundler plugins (`serverless-esbuild`, `serverless-webpack`, `serverless-plugin-typescript`, `serverless-bundle`) — those throw `PLUGIN_TYPESCRIPT_CONFLICT` unless `build.esbuild: false` is set.
+
+`serverless dev` from source and the Dev Mode tests need the gitignored layer zips built first: `npm run build:devmode:layer -w @serverless/framework` (needs Go; CI does this as a separate step). Web apps in `serverless dev` also need the web bridge zip: `npm run build:devmode:web-bridge -w @serverless/framework`.
+
+New integration tests must be self-cleaning (deploy → exercise → teardown, even on failure), use unique stack names so parallel runs are safe, and contain no secrets or account IDs in fixtures or assertions.
+
+### Other Suites
+
+```bash
+npm test -w @serverless/mcp                          # mcp unit + e2e tests (CI runs only the unit part; tests/e2e is not run by any workflow)
+npm test -w @serverless/engine                       # engine unit tests
+npm run test:python -w @serverlessinc/sf-core        # python plugin tests
+npm run test:build -w @serverlessinc/sf-core         # build + pack the release locally, then run the packaging checks
+npm run test:e2e:proxy -w @serverlessinc/sf-core     # CLI from source through a local proxy (needs SERVERLESS_ACCESS_KEY_DEV + AWS credentials)
+packages/sf-core/tests/e2e/proxy-only-network.sh     # the same in a Docker network whose only way out is a proxy, on Node.js 24 and 26
+cd binary-installer && go test ./... && make build-prod   # Go installer
+cd binary-installer && make test-e2e                     # Go installer end to end: real downloads, needs node
+cd dev-mode-bridge && go vet ./... && go test -race ./... && make vuln   # Dev Mode bridge (wrapper tests need bash >= 4 and curl)
+```
+
+The CI python job is path-filtered (runs only when python plugin paths change) — failures can sit unnoticed on main until a PR touches those paths. `packages/util` has no test suite of its own: its tests live in `packages/serverless/test/unit/lib/util/` (the proxy helpers), and the rest of util is exercised only through its consumers' suites.
+
+### Testing CLI Behavior Headlessly
+
+Never drive the CLI through a pty (`script`, `pty.spawn`): a pty is indistinguishable from a real terminal, so spinners animate and interactive prompts open. Use plain pipes — the interactivity gate is typically `stdin.isTTY && stdout.isTTY && !CI`.
+
+## Distribution & Bundling
+
+The released CLI is bundled with esbuild into a single file. Standard `import`/`export` modules are bundled automatically, but **non-JS assets and anything loaded via a `__dirname`-relative path** (JSON, `.py` files, templates, spawned scripts) must be explicitly registered in `packages/sf-core/scripts/prepareDistributionTarballs.js` — otherwise the code works from source and breaks in the release. The checks that the packed package works live in one script, `packages/sf-core/scripts/verify-release-package.sh`, run by the release before any upload, by PR CI (Test: Release Package) and by `test:build`; add new packaging checks there, not at the call sites.
+
+Keep `esbuild` listed in `external` in `packages/sf-core/esbuild.js` — bundling esbuild's own code breaks the worker it spawns (see the comment there).
+
+`packages/framework-dist` is an empty shell in git: its contents are generated at build time. The npm `serverless` package (`sf-core-installer`) only downloads the Go launcher binary, which resolves `frameworkVersion` per project, downloads the release tarball built from `framework-dist`, and installs it into `~/.serverless/releases/<version>` (running `npm install` for archives that declare dependencies) — the published tarball contents directly become end-user installs. Launcher behavior (version resolution, caching, 24h update throttle) is documented in `binary-installer/README.md`.
+
+## Agent Skills (`skills/`)
+
+Any content change to a skill requires bumping its `metadata.version` and regenerating the manifest, or CI fails:
+
+```bash
+node packages/sf-core/scripts/lint-skills.js --update
+```
+
+Commit `skills/manifest.json` alongside. Aux files are never deleted from user installs — add or rename files instead of repurposing an existing filename. See `skills/README.md` for the full contract. Bundled skills can be printed without installing via `serverless agent skills list` / `serverless agent skills read <name>`; the packaged docs via `serverless agent docs` (runners in `packages/sf-core/src/lib/runners/core/agent-docs.js` and `agent-skills-read.js`).
+
+## CI Pipeline
+
+CI runs on pull requests targeting `main`, on Node.js 24.x. The framework unit tests also run on Node.js 26.x, as do the ARM Linux integration legs in release and `all-platforms` runs:
+
+- **CI: Framework CLI** — Lint, Test: Engine, Test: Release Package (builds and packs the release package, then runs the packaging checks), and the unit and integration tests from the shared `.github/workflows/test-framework.yml`: one integration leg per test account, sharded by `packages/sf-core/tests/integration/shards.json`, plus a leg for the resolvers suite, and E2E: proxy-only network (`packages/sf-core/tests/e2e/proxy-only-network.sh`: the CLI from source on Node.js 24 and 26 in a Docker network whose only way out is a proxy). Runs on Linux; a manual dispatch with `all-platforms` also runs ARM Linux and Windows. Skipped entirely for docs-only changes (`paths-ignore: docs/**`) and for draft PRs.
+- **CI: Binary Installer** — Go unit tests and an end-to-end suite (`binary-installer/e2e`, parallel first runs against real releases) on Linux, macOS, and Windows, plus the production build; runs only when `binary-installer/**` changes
+- **Cleanup: Test Accounts** — nightly, on the main repository only: reports integration-test stacks, state-bucket keys and Dev Mode test resources (suffixed broker roles and layers, payload objects under `serverless-dev-mode/`) left behind in each test account by interrupted runs (`packages/sf-core/scripts/test-account-cleanup/`). A dry run; it deletes nothing yet.
+- **CI: NPM Installer** — `packages/sf-core-installer` tests on Linux, macOS and Windows × Node.js 18, 24 and the latest release, failing on any Node.js deprecation; runs when that package changes and weekly, because a new Node.js release can break the npm install path with no change in this repository. Its end-to-end jobs (`npm run test:e2e` in that package; needs internet) install the packed package from a local registry with npm, pnpm, Yarn and Bun, directly and through proxies, and once more in a Docker network whose only way out is a proxy (`tests/e2e/proxy-only-network.sh`)
+- **CI: Python Requirements** — path-filtered (see Testing above)
+- **CI: Dev Mode Bridge** — Go vet/tests and a reproducible layer build; runs only when `dev-mode-bridge/**` or the layer build script changes
+- **CI: Dev Mode** — the live `dev-mode` suite in test-1 on Linux, plus its `agent-loop` file on Windows; path-filtered to the Dev Mode plugin, the bridge, the esbuild plugin (the dev-build interface) and the suite's tests and helpers
+- **CI: MCP Servers** — the live `mcp` suite; path-filtered to the MCP plugin, the api-gateway and esbuild seams, and the MCP tests/fixtures. GitHub Actions has no job-level path filter, which is why this, the Dev Mode suite and the python suite each live in their own workflow file.
+
+The `release-*.yml` workflows run only on push to main or manual dispatch. `release-framework.yml` runs its tests through the same `test-framework.yml` as PR CI, on Linux, ARM Linux and Windows, and its release jobs run only after every one of those tests passed; `packages/sf-core/tests/unit/release-workflow-gate.test.js` fails if that gate is weakened or the shared workflow gains a trigger or release step. The release jobs themselves are never exercised by PR CI, so review changes to them with extra care. `release-framework.yml` is additionally path-filtered to `packages/{sf-core,serverless,engine,mcp}/**` and `dev-mode-bridge/**`: changes elsewhere (e.g. `packages/util`) never trigger a release build on their own.
+
+## Pull Requests & Releases
+
+- PRs are **squash-merged**; the PR title becomes the commit message. Use conventional format: `type(scope): description` — imperative mood, no trailing period, ~72 chars max. Types: feat, fix, perf, docs, refactor, test, ci, chore.
+- Any `feat:` triggers a minor release; only `fix:`/`chore:` means a patch. See [VERSIONING.md](VERSIONING.md) for the full semver interpretation — notably, changes to CLI output structure and to generated CloudFormation count as **breaking**.
+- Non-trivial features and fixes should have an open issue first — see [CONTRIBUTING.md](CONTRIBUTING.md).
+- User-facing changes (behavior, config surface, CLI output) should update the docs in `docs/sf/` in the same PR.
+- The root `README.md` is copied into the published npm package at release time — edits to it are user-facing.
+- Every push to `main` touching the release-relevant packages automatically publishes a **canary** build, versioned by git short SHA (users opt in with `frameworkVersion: canary`) — code merged to main is live on the canary channel within minutes, so main must always be releasable.
+- A stable release bumps the version in BOTH `packages/sf-core-installer/package.json` and `packages/sf-core/package.json`, in a PR titled exactly `chore: release x.x.x`; on merge, CI tags `sf-core@x.y.z` (use these tags to diff what shipped since the last release). npm is a secondary distribution channel; the curl installer (`install.serverless.com`) is primary. Full pipeline: [RELEASE_PROCESS.md](RELEASE_PROCESS.md).
+
+## Important Files
+
+- `packages/sf-core/bin/sf-core.js` - CLI entry point
+- `packages/sf-core/src/lib/router.js` - command dispatcher
+- `packages/serverless/lib/config-schema.js` - base `serverless.yml` schema (plugins extend it)
+- `packages/serverless/lib/classes/plugin-manager.js` - authoritative registry of native/bundled plugins (`lib/plugins/index.js` is not the full list)
+- `packages/sf-core/scripts/prepareDistributionTarballs.js` - non-bundled asset registry for releases
+- `packages/standards/src/eslint.js` / `prettier.js` - lint and format configuration

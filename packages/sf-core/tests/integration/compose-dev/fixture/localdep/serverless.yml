@@ -1,0 +1,10 @@
+service: compose-devtest-localdep
+provider:
+  name: aws
+resources:
+  Resources:
+    Topic:
+      Type: AWS::SNS::Topic
+  Outputs:
+    TopicArn:
+      Value: !Ref Topic

@@ -1,0 +1,33 @@
+service: cfmany-consumer
+frameworkVersion: '4'
+
+stages:
+  default:
+    resolvers:
+      awsAcc:
+        type: aws
+
+custom:
+  sourceA: cfmany-src-a-${sls:stage}
+  sourceB: cfmany-src-b-${sls:stage}
+
+provider:
+  name: aws
+  environment:
+    LEGACY_A1: ${cf:cfmany-src-a-${sls:stage}.OutA}
+    LEGACY_A2: ${cf:cfmany-src-a-${sls:stage}.OutB}
+    LEGACY_A3: ${cf:cfmany-src-a-${sls:stage}.OutC}
+    LEGACY_B1: ${cf:cfmany-src-b-${sls:stage}.OutA}
+    LEGACY_B2: ${cf:cfmany-src-b-${sls:stage}.OutB}
+    LEGACY_B3: ${cf:cfmany-src-b-${sls:stage}.OutC}
+    NESTED_A1: ${cf:${self:custom.sourceA}.OutA}
+    NESTED_B2: ${cf:${self:custom.sourceB}.OutB}
+    REGION_A1: ${cf(${opt:region}):cfmany-src-a-${sls:stage}.OutA}
+    REGION_B3: ${cf(${opt:region}):cfmany-src-b-${sls:stage}.OutC}
+    NAMED_A2: ${awsAcc:cf:cfmany-src-a-${sls:stage}.OutB}
+    NAMED_B1: ${awsAcc:cf:cfmany-src-b-${sls:stage}.OutA}
+    FALLBACK: ${cf:cfmany-src-a-${sls:stage}.Missing, 'fallback-value'}
+
+functions:
+  hello:
+    handler: handler.hello

@@ -1,0 +1,1375 @@
+/**
+ * Logger
+ * Renders logs, progress, and more to the console,
+ * with support for different log levels and styling.
+ */
+
+import util from 'util'
+import Enquirer from 'enquirer'
+import chalk from 'chalk'
+import ora from 'ora'
+import { shouldDisableColors } from '../agent/index.js'
+
+const supportsColor = chalk.supportsColor
+
+/**
+ *
+ * Renderer Global Settings
+ *
+ */
+const renderer = {}
+renderer.isInitialized = false
+// Set up the state storage for namespaces and progress instances
+renderer.state = {
+  namespaces: new Map(),
+  progressTasks: new Map(),
+  // Store the last message printed to the console
+  // Start with empty line since a blank line is always created upon start.
+  lastToken: '',
+  // Whether the line above the next one is blank: a blank line was the last thing written, or
+  // the spinner wrote one above itself. `gap()` reads it; `lastToken` alone cannot tell, since a
+  // stopped spinner empties it whether or not a blank line is above.
+  blankAbove: false,
+  // What standard output and standard error had written (less the spinner's frames) when
+  // `blankAbove` was last set: output written straight to them since (a plugin's console.log, a
+  // stream) means the line above is not blank.
+  bytesAtBlank: null,
+  // The bytes the spinner wrote to standard error.
+  spinnerBytes: 0,
+  // Whether the spinner keeps a blank line above itself (see `progress.setBlankLineAboveSpinner`).
+  spinnerBlankLine: true,
+}
+/** What `stream` says it has written; null for a stream that keeps no count (a file). */
+const bytesOf = (stream) => {
+  const count = stream?.bytesWritten
+  return typeof count === 'number' ? count : null
+}
+/**
+ * The bytes written so far by others than the spinner: standard output's, and standard error's
+ * less the spinner's frames (they are drawn through `spinnerStream`). Null when a stream keeps no
+ * count.
+ */
+const foreignBytes = () => {
+  const stdout = bytesOf(process.stdout)
+  const stderr = bytesOf(process.stderr)
+  return stdout === null || stderr === null
+    ? null
+    : `${stdout}:${stderr - renderer.state.spinnerBytes}`
+}
+/** Records whether the line above the next one is blank, and the output it was measured at. */
+const markBlankAbove = (blank) => {
+  renderer.state.blankAbove = blank
+  renderer.state.bytesAtBlank = blank ? foreignBytes() : null
+}
+/**
+ * Whether the line above the next one is blank: one was written last through this renderer, and
+ * nothing else was written to standard output or standard error since (a plugin's console.log,
+ * a stream). Where a stream keeps no count, nothing tells, and the answer is no.
+ */
+const blankLineAbove = () =>
+  renderer.state.blankAbove &&
+  renderer.state.bytesAtBlank !== null &&
+  foreignBytes() === renderer.state.bytesAtBlank
+
+/**
+ * Standard error as the spinner writes to it, counting what it writes (its frames, cursor moves
+ * and clears), so that those bytes never look like output from elsewhere.
+ */
+const spinnerStream = () => {
+  const target = process.stderr
+  const stream = Object.create(target)
+  stream.write = (chunk, ...rest) => {
+    renderer.state.spinnerBytes +=
+      typeof chunk === 'string'
+        ? Buffer.byteLength(chunk)
+        : (chunk?.length ?? 0)
+    return target.write(chunk, ...rest)
+  }
+  return stream
+}
+
+// Color support level
+renderer.colorSupportLevel =
+  typeof supportsColor === 'object' ? supportsColor.level : 3
+// Whether the logger colours what chalk does not: objects in log messages (util.inspect colours
+// independently of chalk), the spinner frame (ora brings its own chalk instance) and prompts
+// (enquirer uses ansi-colors). Those libraries never read NO_COLOR, and util.inspect and ansi-colors
+// not FORCE_COLOR=false either. The level above is never 0 at load (it falls back to 3, FORCE_COLOR=0
+// included), so this stays true until applyColorRule turns colours off at startup.
+const colorsEnabled = () => renderer.colorSupportLevel > 0
+// Interactive setting.
+//
+// Animations (the ora spinner) additionally require a USABLE terminal width. A pty created without
+// a window size reports `columns: 0` (e.g. `script`/`pty.spawn`/some CI and agent harnesses), and
+// ora's clear-line math `ceil(stringWidth / columns)` then divides by zero → `Infinity` lines to
+// clear → an unbounded clear loop that emits gigabytes of escape sequences. Note `columns ?? 80`
+// in ora does NOT guard this (0 is not nullish). So we treat a 0/undefined width as non-interactive
+// and fall back to the bounded plain-text path — exactly like a pipe.
+//
+// A zero-width TTY vetoes interactivity on EVERY path, including the `SLS_INTERACTIVE_SETUP_ENABLE`
+// override: CircleCI allocates a zero-width pty for build steps, and an override that bypassed the
+// width guard force-enabled the spinner there and re-created the unbounded clear loop (GitHub
+// issue #13786). stderr is vetoed too because the spinner renders to stderr. Non-TTY streams are
+// NOT vetoed — the override keeps enabling interactive flows for scripted (piped) setups, and ora
+// skips its clear-line path entirely on non-TTY streams, so no flood is possible there.
+//
+// An AI coding agent (see `src/agent`) is never interactive: it cannot answer prompts, and spinner
+// redraws garble the output it captures. The override still wins over agent detection, so a human
+// who was wrongly detected as an agent can get prompts back. Without an agent the result is the
+// same as `hasUsableTty || override` after the width veto.
+function computeIsInteractive(options) {
+  const {
+    stdin = process.stdin,
+    stdout = process.stdout,
+    stderr = process.stderr,
+    env: givenEnv,
+    isAgent = false,
+  } = options ?? {}
+  // Anything but an object (null included) means the process environment.
+  const env =
+    givenEnv !== null && typeof givenEnv === 'object' ? givenEnv : process.env
+  const isZeroWidthTty = (stream) =>
+    Boolean(stream.isTTY) &&
+    !(Number.isInteger(stream.columns) && stream.columns > 0)
+  if (isZeroWidthTty(stdout) || isZeroWidthTty(stderr)) return false
+  if (env.SLS_INTERACTIVE_SETUP_ENABLE) return true
+  if (isAgent) return false
+  return (
+    Boolean(stdin.isTTY) && Boolean(stdout.isTTY) && typeof env.CI !== 'string'
+  )
+}
+renderer.isInteractive = computeIsInteractive()
+// Whether progress may render as a spinner animation: the session must be interactive AND the
+// stream ora draws on (stderr) must be a terminal. When this is false, progress must take the
+// plain per-message path — a disabled ora instance never renders `.text` updates, so routing
+// progress through it would drop phases (and every spinner restart around a log write would
+// re-print the current one).
+const canAnimateProgress = () =>
+  renderer.isInteractive && Boolean(process.stderr.isTTY)
+// Log levels
+renderer.levels = {
+  compose: 0, // This is for compose. It is the lowest log level to have full control over the CLI.
+  error: 1, // This is for error messages
+  warning: 2, // This is for warning messages
+  notice: 3, // This is the default log level and is used for short and clear messages in the default CLI experience.
+  info: 4, // This is for additional information that is helpful to know when running actions.
+  debug: 5, // This is for system debugging information.
+}
+// Set global log level to "notice"
+renderer.logLevel = 'notice'
+/**
+ * Global Spinner
+ *
+ * This is spinner is used to show loading progress, and it's
+ * shared by all loggers. It's a singleton instance of the ora spinner.
+ * It's wrapped in a spinner object to allow for starting, stopping, and updating,
+ * easily.
+ * It's handled by the writeProgress method.
+ *
+ * Please note, this spinner always tries to keep the line before it blank,
+ * it does this via the lastToken property.
+ */
+renderer.spinner = {
+  // Store the instance of the Ora spinner here
+  _spinner: null,
+  isInitialized: () => renderer.spinner._spinner != null,
+  isSpinning: () =>
+    renderer.spinner.isInitialized() && renderer.spinner._spinner.isSpinning,
+  start: (
+    { content, lineBreak = true, isComposeMessage = false } = {
+      lineBreak: true,
+    },
+  ) => {
+    /**
+     * Only start if there are progress states to render
+     */
+    const progressStates = Array.from(renderer.state.progressTasks.values())
+    const progressStatesWithMessages = progressStates.filter(
+      (progressState) => progressState.message,
+    )
+    if (progressStatesWithMessages.length === 0) {
+      return
+    }
+
+    if (renderer.logLevel === 'compose' && !isComposeMessage) {
+      return
+    }
+
+    /**
+     * Do not start if log level is not "notice" or "info"
+     */
+    if (
+      renderer.logLevel !== 'compose' &&
+      renderer.logLevel !== 'notice' &&
+      renderer.logLevel !== 'info'
+    ) {
+      return
+    }
+
+    /**
+     * When the log level is "notice", we try to keep the line before the spinner blank.
+     * We do this by reviewing the last logged message, and ensuring the lineBreak is true.
+     */
+    if (
+      renderer.state.lastToken !== '' &&
+      lineBreak &&
+      renderer.state.spinnerBlankLine &&
+      (renderer.logLevel === 'notice' || renderer.logLevel === 'compose')
+    ) {
+      // On stderr, where the spinner draws: the blank line stays with it when stdout is a file.
+      process.stderr.write('\n')
+      renderer.state.lastToken = ''
+      markBlankAbove(true)
+    }
+
+    if (renderer.spinner.isInitialized()) {
+      renderer.spinner._spinner.start()
+    } else {
+      renderer.spinner._spinner = ora({
+        color: colorsEnabled() ? 'red' : false,
+        text: content,
+        isEnabled: canAnimateProgress(),
+        stream: spinnerStream(),
+      }).start()
+    }
+  },
+  stop: () => {
+    if (renderer.spinner._spinner) {
+      renderer.spinner._spinner.stop()
+      renderer.state.lastToken = ''
+    }
+  },
+  update: ({ content, isComposeMessage = false } = {}) => {
+    if (
+      renderer.spinner.isInitialized() &&
+      (isComposeMessage || renderer.logLevel !== 'compose')
+    ) {
+      renderer.spinner._spinner.text = content
+    }
+  },
+}
+
+// Colors
+renderer.colors = {
+  default: (param) => param,
+  white: (param) => param,
+  red:
+    renderer.colorSupportLevel > 2 ? chalk.rgb(253, 87, 80) : chalk.redBright,
+  yellow:
+    renderer.colorSupportLevel > 2
+      ? chalk.rgb(255, 165, 0)
+      : chalk.yellowBright,
+  green: chalk.green,
+  gray: renderer.colorSupportLevel > 2 ? chalk.rgb(140, 141, 145) : chalk.gray,
+  grey: renderer.colorSupportLevel > 2 ? chalk.rgb(140, 141, 145) : chalk.gray,
+}
+// Default styles
+renderer.style = {
+  bold: chalk.bold,
+  debug: (text) => text,
+  info: renderer.colors.default,
+  notice: renderer.colors.default,
+  warning: renderer.colors.gray,
+  error: renderer.colors.red,
+  aside: renderer.colors.gray,
+  link: (text) => text, // Keep as is, no chalk styling
+  linkStrong: chalk.underline,
+  symbol: renderer.colors.red,
+  strong: renderer.colors.red,
+  title: chalk.underline,
+}
+
+/**
+ * Maps a string to a "safe" color using chalk.
+ * Useful for colorizing strings consistenyl based on their content.
+ */
+const stringToSafeColor = (str) => {
+  let hash = 0
+  for (let i = 0; i < str.length; i++) {
+    hash = str.charCodeAt(i) + ((hash << 5) - hash)
+  }
+
+  const base = 128
+  const range = 127
+
+  const red = base + (hash & range)
+  const green = base + ((hash >> 8) & range)
+  const blue = base + ((hash >> 16) & range)
+
+  return chalk.rgb(red, green, blue)
+}
+
+/**
+ * Colorize a string based on its "safe" color
+ */
+const colorizeString = (str) => {
+  const colorFn = stringToSafeColor(str)
+  return colorFn(str)
+}
+
+/**
+ * Set the Renderer's global settings.
+ */
+const setGlobalRendererSettings = ({
+  logLevel = null,
+  isInteractive = null,
+}) => {
+  if (typeof logLevel === 'string') {
+    if (renderer.levels[logLevel] === undefined) {
+      throw new Error(`Invalid log level ${logLevel}.`)
+    }
+    renderer.logLevel = logLevel
+  }
+  if (typeof isInteractive === 'boolean') {
+    renderer.isInteractive = isInteractive
+  }
+}
+
+/**
+ * Turn colours off when the shared rule says so (shouldDisableColors): FORCE_COLOR=0 or false, or
+ * without FORCE_COLOR, NO_COLOR or an AI coding agent (escape codes are noise in the output it
+ * captures). The agent passed is the one that counts; a missing one means no agent. Pre-built
+ * chalk styles (renderer.colors/style) read the instance's level on every call, so lowering the
+ * level is enough; util.inspect, the spinner and prompts follow colorsEnabled().
+ */
+const applyColorRule = ({ agent, env }) => {
+  if (!shouldDisableColors({ agent: agent ?? null, env })) return
+  chalk.level = 0
+  renderer.colorSupportLevel = 0
+}
+
+/**
+ * Apply the session's renderer settings once the agent is known, before anything is rendered:
+ * the colour rule for every session (NO_COLOR applies to people too), and for an AI coding agent
+ * a non-interactive renderer. Only ever turns interactivity off; the zero-width veto and
+ * SLS_INTERACTIVE_SETUP_ENABLE keep their precedence (computeIsInteractive).
+ */
+const applyAgentSession = (options) => {
+  const { agent, env } = options ?? {}
+  applyColorRule({ agent, env })
+  if (!agent?.isAgent) return
+  renderer.isInteractive = computeIsInteractive({ env, isAgent: true })
+}
+
+/**
+ * enquirer styles everything but the overrides given here with ansi-colors, which only reads
+ * FORCE_COLOR=0; `enabled: false` turns it off whenever the colour rule did. Left out otherwise, so
+ * enquirer keeps its own default.
+ */
+const promptStyles = (styles) =>
+  colorsEnabled() ? styles : { ...styles, enabled: false }
+
+// Test-only: the logger's chalk instance is private to @serverless/util (a different chalk major
+// than the rest of the workspace), so tests read and restore its level through these.
+const getColorSettingsForTests = () => ({
+  chalkLevel: chalk.level,
+  colorSupportLevel: renderer.colorSupportLevel,
+})
+
+const setColorSettingsForTests = ({ chalkLevel, colorSupportLevel }) => {
+  chalk.level = chalkLevel
+  renderer.colorSupportLevel = colorSupportLevel
+}
+
+/**
+ * Get the Renderer's global settings.
+ */
+const getGlobalRendererSettings = () => {
+  return {
+    logLevel: renderer.logLevel,
+    isInteractive: renderer.isInteractive,
+  }
+}
+
+/**
+ * Handles writing logs to the stderr.
+ * Only writes logs if the log level is less than or equal to the global log level.
+ * If a prefix is provided, prepends it to the log message.
+ * If a prefixColor is provided, applies the color to the prefix.
+ * If a type is provided, applies the type styling to the log message.
+ * If no type is provided, applies the default styling to the log message.
+ */
+const writeStdErr = ({
+  level = renderer.logLevel,
+  messageTokens = [],
+  type = null,
+  prefix = null,
+  prefixColor = null,
+  disableNewLine = null,
+}) => {
+  level = level || renderer.logLevel
+
+  // If the log level is higher than the global log level, do not write the log
+  if (renderer.levels[level] > renderer.levels[renderer.logLevel]) {
+    return
+  }
+
+  // Stop the spinner to not collide with log output
+  renderer.spinner.stop()
+
+  // Process the message tokens
+  let formattedMessage = ''
+
+  // Remove first token
+  const firstToken = messageTokens.shift()
+
+  // Check if firstToken is actually a string and contains placeholders
+  if (typeof firstToken === 'string' && /%[sd]/.test(firstToken)) {
+    // Replace format specifiers with values from the messageTokens
+    formattedMessage = firstToken.replace(/%s|%d/g, () => {
+      const token = messageTokens.shift()
+      if (typeof token === 'object' && token !== null) {
+        return util.inspect(token, { colors: colorsEnabled(), depth: null })
+      }
+      return token
+    })
+  } else {
+    // Often empty messages are used to create blank lines
+    if (firstToken === undefined) {
+      formattedMessage = ''
+    } else if (firstToken instanceof Error) {
+      formattedMessage = firstToken.stack
+        ? firstToken.stack
+        : firstToken.message
+    } else if (typeof firstToken === 'object' && firstToken !== null) {
+      formattedMessage = util.inspect(firstToken, {
+        colors: colorsEnabled(),
+        depth: null,
+      })
+    } else {
+      formattedMessage = firstToken
+    }
+  }
+
+  // Process remaining tokens if any exist after the initial formatting
+  while (messageTokens.length > 0) {
+    const token = messageTokens.shift()
+    let messageContent = ''
+    if (token instanceof Error) {
+      messageContent = token.toString()
+    } else if (typeof token === 'object' && token !== null) {
+      messageContent = util.inspect(token, {
+        colors: colorsEnabled(),
+        depth: null,
+      })
+    } else {
+      messageContent = token ? token.toString() : ''
+    }
+    formattedMessage += ' ' + messageContent
+  }
+
+  const styledMessage =
+    type && renderer.style[type]
+      ? renderer.style[type](formattedMessage)
+      : formattedMessage
+
+  let fullPrefix = ''
+  let outputPrefix = ''
+  if (prefix) {
+    fullPrefix = prefixColor ? prefixColor(prefix) : renderer.style.info(prefix)
+    outputPrefix = fullPrefix !== '' ? `${fullPrefix} ` : ''
+  }
+  if (type === 'success') {
+    fullPrefix +=
+      (fullPrefix ? ' ' : '') +
+      (prefixColor != null ? prefixColor('✔') : renderer.colors.red('✔'))
+    outputPrefix = fullPrefix !== '' ? `${fullPrefix} ` : ''
+  }
+  if (type === 'debug') {
+    fullPrefix = prefix ? colorizeString(prefix) : fullPrefix
+    outputPrefix = fullPrefix !== '' ? `${fullPrefix} ` : ''
+  }
+  if (type === 'error') {
+    fullPrefix += (fullPrefix ? ' ' : '') + renderer.style.error('✖')
+    outputPrefix = fullPrefix !== '' ? `${fullPrefix} ` : ''
+  }
+  if (type === 'warning') {
+    fullPrefix += (fullPrefix ? ' ' : '') + renderer.colors.red('[!]')
+    outputPrefix = fullPrefix !== '' ? `${fullPrefix} ` : ''
+  }
+
+  // Write the log to stderr
+  let fullMessage = `${outputPrefix}${styledMessage}`
+
+  if (!disableNewLine) {
+    fullMessage = `${fullMessage}\n`
+  }
+
+  process.stderr.write(fullMessage)
+  markBlankAbove(fullMessage === '\n')
+
+  // Save last token. A blank line is the blank line the spinner keeps above itself: it does not
+  // print a second one.
+  renderer.state.lastToken = fullMessage === '\n' ? '' : fullMessage
+
+  // Restart the spinner if it was stopped
+
+  const startOptions = {}
+
+  if (level === 'compose') {
+    startOptions.isComposeMessage = true
+  }
+
+  renderer.spinner.start(startOptions)
+}
+
+/**
+ * Handles writing progress to the console.
+ * If there are multiple progress states,
+ * updates the renderer.spinner text with the number of states,
+ * otherwise updates the renderer.spinner text with the progress state value.
+ * If there are no progress states, stops the renderer.spinner.
+ */
+const writeProgress = ({ namespace = null, isComposeMessage } = {}) => {
+  /**
+   * It's common for progress states to be created,
+   * but have no messages. So, we only want to count progress states
+   * that have messages to determine if we should stop the spinner,
+   * or what it should display.
+   */
+  const progressStates = Array.from(renderer.state.progressTasks.values())
+  const progressStatesWithMessages = progressStates.filter(
+    (progressState) => progressState.message,
+  )
+
+  // If no progress states with messages exist, stop/destroy the renderer.spinner
+  if (!isComposeMessage && progressStatesWithMessages.length === 0) {
+    renderer.spinner.stop()
+    renderer.spinner._spinner = null
+    return
+  }
+
+  // If progress states with messages exist, handle display
+  let content
+  if (progressStatesWithMessages.length > 1) {
+    // If there are multiple progress states, update the renderer.spinner text
+    const additionalTaskCount = progressStatesWithMessages.length - 1
+    content = `${
+      progressStatesWithMessages[0].message
+    } (and ${additionalTaskCount} more ${
+      additionalTaskCount < 2 ? 'task' : 'tasks'
+    })`
+  } else if (progressStatesWithMessages.length === 1) {
+    // If there is only one progress state, update the renderer.spinner text with its value
+    content = progressStatesWithMessages[0].message
+  }
+
+  // If renderer is set to debug mode and there are progress states, log the progress states
+  if (renderer.logLevel === 'debug') {
+    // Use the existing prefix if set, otherwise default to the namespacePrefix
+    writeStdErr({
+      level: 'debug',
+      type: 'debug',
+      messageTokens: [content],
+      prefix: `${namespace || 'unknown'}:`,
+    })
+    return
+  }
+
+  if (!renderer.spinner.isInitialized()) {
+    renderer.spinner.start({ content, isComposeMessage })
+  } else {
+    renderer.spinner.update({ content, isComposeMessage })
+  }
+}
+
+/**
+ * Handles writing text to the console.
+ */
+const writeText = (...textTokens) => {
+  // Stop the spinner to not collide with log output
+  renderer.spinner.stop()
+
+  const text = joinTextTokens(textTokens)
+  process.stdout.write(joinTextTokens(text))
+
+  renderer.state.lastToken = text
+  renderer.state.blankAbove = false
+
+  // Restart the spinner if it was stopped
+  renderer.spinner.start({ lineBreak: false })
+}
+
+/**
+ * Join text tokens for the writeText method, ensuring correct array handling and joining.
+ * This function ensures that it can handle both array and non-array inputs gracefully.
+ */
+const joinTextTokens = (textTokens) => {
+  // Function to deeply flatten an array
+  const flattenDeep = (array) => {
+    // Make sure the input is actually an array; otherwise, wrap it in one
+    if (!Array.isArray(array)) return [array]
+
+    return array.reduce(
+      (acc, val) =>
+        Array.isArray(val) ? acc.concat(flattenDeep(val)) : acc.concat(val),
+      [],
+    )
+  }
+
+  // Make sure the initial input is treated as an array if it is not
+  const flattened = flattenDeep(
+    Array.isArray(textTokens) ? textTokens : [textTokens],
+  )
+
+  // Filter out non-string elements and join the remaining strings with newlines
+  const finalText = flattened
+    .filter((textToken) => typeof textToken === 'string')
+    .join('\n')
+
+  // If the final text does not end with a new line, add one for separation
+  if (!finalText.endsWith('\n')) {
+    return finalText + '\n'
+  }
+
+  return finalText
+}
+
+/**
+ * Handles progress state and write operations
+ */
+class Progress {
+  constructor({ namespace = null } = {}) {
+    this.namespace = namespace
+    // If it doesn't start with "s:", add it
+    if (!this.namespace.startsWith('s:')) {
+      this.namespace = `s:${this.namespace}`
+    }
+    this.message = null
+  }
+
+  /**
+   * Find or create a Progress instance.
+   */
+  static get(namespace) {
+    const formattedNamespace = namespace.startsWith('s:')
+      ? namespace
+      : `s:${namespace}`
+    if (!renderer.state.progressTasks.has(formattedNamespace)) {
+      renderer.state.progressTasks.set(
+        formattedNamespace,
+        new Progress({ namespace: formattedNamespace }),
+      )
+    }
+    return renderer.state.progressTasks.get(formattedNamespace)
+  }
+
+  /**
+   * Though you cannot create children of progress instances,
+   * this method is provided for consistency with the Logger class,
+   * but it returns a peer progress instance instead of a child.
+   */
+  get(namespace) {
+    return Progress.get(namespace)
+  }
+
+  /**
+   * Updates the progress state with a new message.
+   */
+  notice(message, { isComposeMessage = false } = {}) {
+    if (!canAnimateProgress()) {
+      // 'info' is deliberate for compose messages too: Compose's aggregated
+      // progress line (re-noticed with a shrinking service list) only makes
+      // sense morphing in place inside the spinner. On the plain path the
+      // 'compose' log level filters it out, and non-animated compose runs
+      // report per-service completion lines via writeCompose instead.
+      writeStdErr({ level: 'info', messageTokens: [message] })
+      return
+    }
+    if (renderer.state.progressTasks.has(this.namespace) === undefined) {
+      throw new Error(
+        `Progress state with name ${this.namespace} does not exist.`,
+      )
+    }
+    this.message = message
+    writeProgress({ namespace: this.namespace, isComposeMessage })
+  }
+
+  /**
+   * Removes the progress state and the namespace from the renderer instance.
+   * Stops the renderer.spinner if there are no progress states.
+   */
+  remove() {
+    if (!canAnimateProgress() || renderer.logLevel === 'compose') {
+      return
+    }
+    if (renderer.state.progressTasks.has(this.namespace) === undefined) {
+      return
+    }
+    this.message = null
+    writeProgress()
+  }
+
+  /**
+   * Copy and return the current progress state.
+   * This is useful for saving and restoring the progress state externally.
+   * For example, you may want to save the message, alter it, and then restore it.
+   */
+  getState() {
+    if (!canAnimateProgress()) {
+      return
+    }
+    if (renderer.state.progressTasks.has(this.namespace) === undefined) {
+      return
+    }
+    return { ...renderer.state.progressTasks.get(this.namespace) }
+  }
+
+  /**
+   * Below are deprecated methods kept for backward compatibility.
+   */
+
+  /**
+   * Backware Compatibility Support
+   * This is not needed due to simply using .get() and .notice() instead.
+   * It's provided here for backward compatibility.
+   * The "name" parameter is defunct and does nothing.
+   * Otherwise the 'notice()' method is called
+   * DO NOT USE THIS METHOD. Use the methods above instead.
+   */
+  create({ name, message } = {}) {
+    this.notice(message)
+    return this
+  }
+
+  update(message) {
+    this.notice(message)
+  }
+
+  info(message) {
+    this.notice(message)
+  }
+}
+
+/**
+ * The main interface for dependencies to use for
+ * writing logs, progress and more.
+ */
+class Logger {
+  constructor({ namespace = null, prefix = null, prefixColor = null } = {}) {
+    // Validate namespace exists
+    if (namespace != null && typeof namespace !== 'string') {
+      throw new Error('Logger requires a "namespace" and it must be a string.')
+    }
+    // Sanitize the namespace. Lowercase, remove whitespace, and replace spaces with hyphens
+    namespace = namespace
+      ? namespace
+          .toLowerCase()
+          .replace(/\s+/g, '-')
+          .replace(/[^a-z0-9-:]/g, '')
+      : null
+    // Validate namespace exists, is a string, is not empty, and meets this regex (/^[a-z0-9-:]+$/)
+    if (
+      namespace != null &&
+      (typeof namespace !== 'string' || !/^[a-z0-9-:]+$/.test(namespace))
+    ) {
+      throw new Error(
+        `Logger namespace of ${namespace} is invalid. A namespace is required, must be a string, and can only contain lowercase letters, numbers, hyphens, or colons.`,
+      )
+    }
+
+    this.namespace = namespace
+    this.prefix = prefix
+    this.prefixColor = prefixColor
+  }
+
+  /**
+   * Find or create a child namespace on this renderer instance.
+   */
+  get(newNamespace) {
+    // Get the child namespace
+    newNamespace = `${this.namespace}:${newNamespace}`
+    // Check if the full namespace already exists
+    if (!renderer.state.namespaces.has(newNamespace)) {
+      // If not, create a new renderer instance with the given full namespace
+      renderer.state.namespaces.set(
+        newNamespace,
+        new Logger({
+          namespace: newNamespace,
+        }),
+      )
+    }
+    // Return the renderer instance from the global registry
+    return renderer.state.namespaces.get(newNamespace)
+  }
+
+  /**
+   * Detect whether the Logger is running in an interactive environment.
+   */
+  isInteractive() {
+    return !!renderer.isInteractive
+  }
+
+  /**
+   * Methods for writing logs to the console at different levels.
+   */
+  error(...messageTokens) {
+    writeStdErr({
+      level: 'error',
+      type: 'error',
+      messageTokens: [...messageTokens],
+      prefix: this.prefix,
+      prefixColor: this.prefixColor,
+    })
+  }
+
+  warning(...messageTokens) {
+    writeStdErr({
+      level: 'warning',
+      type: 'warning',
+      messageTokens: [...messageTokens],
+      prefix: this.prefix,
+      prefixColor: this.prefixColor,
+    })
+  }
+
+  notice(...messageTokens) {
+    writeStdErr({
+      level: 'notice',
+      type: 'notice',
+      messageTokens: [...messageTokens],
+      prefix: this.prefix,
+      prefixColor: this.prefixColor,
+    })
+  }
+
+  write(...messageTokens) {
+    writeStdErr({
+      level: 'notice',
+      type: 'notice',
+      messageTokens: [...messageTokens],
+      prefix: this.prefix,
+      prefixColor: this.prefixColor,
+      disableNewLine: renderer.isInteractive ? true : false,
+    })
+  }
+
+  writeCompose(...messageTokens) {
+    writeStdErr({
+      level: 'compose',
+      type: 'compose',
+      messageTokens: [...messageTokens],
+      prefix: this.prefix,
+      prefixColor: this.prefixColor,
+      disableNewLine: renderer.isInteractive ? true : false,
+    })
+  }
+
+  info(...messageTokens) {
+    writeStdErr({
+      level: 'info',
+      type: 'info',
+      messageTokens: [...messageTokens],
+      prefix: this.prefix,
+      prefixColor: this.prefixColor,
+    })
+  }
+
+  debug(...messageTokens) {
+    // Use the existing prefix if set, otherwise default to the namespacePrefix
+    writeStdErr({
+      level: 'debug',
+      type: 'debug',
+      messageTokens: [...messageTokens],
+      prefix: `${this.namespace || 'unknown'}:`,
+    })
+  }
+
+  // New Methods - Title should probably be a style
+  aside(...messageTokens) {
+    writeStdErr({
+      level: 'notice',
+      type: 'aside',
+      messageTokens: [...messageTokens],
+      prefix: this.prefix,
+      prefixColor: this.prefixColor,
+    })
+  }
+
+  title(...messageTokens) {
+    writeStdErr({
+      level: 'notice',
+      type: 'title',
+      messageTokens: [...messageTokens],
+      prefix: this.prefix,
+      prefixColor: this.prefixColor,
+    })
+  }
+
+  success(message) {
+    writeStdErr({
+      level: 'notice',
+      type: 'success',
+      messageTokens: [message],
+      prefix: this.prefix,
+      prefixColor: this.prefixColor,
+    })
+  }
+
+  /**
+   * Writes an empty line to the console in a way that is
+   * safe and doesn't break spinners, etc. DO NOT USE console.log()
+   */
+  blankLine() {
+    writeStdErr({ level: 'notice', messageTokens: [''] })
+  }
+
+  /**
+   * Separates two sections with one blank line, never two: writes a blank line unless the line
+   * above the next one is blank already, after a blank line, or under a spinner, which keeps a
+   * blank line above itself and whose line the next line takes.
+   */
+  gap() {
+    if (!blankLineAbove()) this.blankLine()
+  }
+
+  /**
+   * Renders a confirmation prompt to the console.
+   * @param {Object} param - The parameters for the confirmation prompt.
+   * @param {string} param.message - The message to display for the confirmation prompt.
+   * @param {boolean} param.initial - The initial value for the confirmation prompt.
+   * @returns {Promise<boolean>} - The user's confirmation response.
+   */
+  async confirm({ message, initial }) {
+    // Stop the spinner to not collide with prompt
+    renderer.spinner.stop()
+
+    const enquirer = new Enquirer()
+
+    const response = await enquirer.prompt({
+      type: 'confirm',
+      name: 'confirm',
+      initial: initial ?? true,
+      message: renderer.colors.default(message),
+      // prefix: '',
+      styles: promptStyles({
+        primary: renderer.colors.red,
+        submitted: renderer.colors.red,
+        success: renderer.colors.red,
+      }),
+      // The answer as a person gave it: yes or no, never the boolean the prompt keeps.
+      format(value) {
+        const answer = value ? 'yes' : 'no'
+        return this.state.submitted
+          ? this.styles.success(answer)
+          : this.styles.primary(answer)
+      },
+      onCancel: () => {
+        const err = new Error('Canceled')
+        err.stack = undefined
+        throw err
+      },
+    })
+
+    // Save the last selected value
+    renderer.state.lastToken = response.confirm
+    renderer.state.blankAbove = false
+
+    // Restart the spinner if it was stopped
+    renderer.spinner.start()
+
+    return response.confirm
+  }
+
+  /**
+   * Renders a single input prompt to the console.
+   * @param {Object} param - The parameters for the input prompt.
+   * @param {string} param.message - The message to display for the input prompt.
+   * @returns {Promise<string>} - The user's input.
+   */
+  async input({ message, validate, inputType = 'input', initial }) {
+    // Stop the spinner to not collide with prompt
+    renderer.spinner.stop()
+
+    const enquirer = new Enquirer()
+
+    const response = await enquirer.prompt({
+      type: inputType,
+      name: 'input',
+      message: renderer.colors.default(message),
+      initial,
+      // @ts-expect-error ...
+      styles: promptStyles({
+        danger: renderer.colors.red, // This sets the color for the error message
+        primary: renderer.colors.red, // This sets the primary color to red
+        submitted: renderer.colors.red, // Assuming 'submitted' is the correct property for the final input
+      }),
+      validate: (input) => {
+        let res
+        if (validate) {
+          res = validate(input)
+          if (res === true) {
+            return res
+          }
+          res = renderer.colors.red(res)
+        } else {
+          res = true
+        }
+        return res
+      },
+      onCancel: () => {
+        const err = new Error('Canceled')
+        err.stack = undefined
+        throw err
+      },
+    })
+
+    // Save the last selected value
+    renderer.state.lastToken = response.input
+    renderer.state.blankAbove = false
+
+    // Restart the spinner if it was stopped
+    renderer.spinner.start()
+
+    return response.input
+  }
+
+  /**
+   * Renders a select prompt to the console.
+   * @param param.message string
+   * @param param.choices any[]
+   * @returns
+   */
+  async choose({ message, choices, onCancel }) {
+    // Stop the spinner to not collide with prompt
+    renderer.spinner.stop()
+
+    const enquirer = new Enquirer()
+
+    // Mapping names to values for result processing
+    const nameToValueMap = choices.reduce((map, choice) => {
+      map[choice.name] = choice.value
+      return map
+    }, {})
+
+    const answer = await enquirer.prompt({
+      type: 'select',
+      name: 'select',
+      choices: choices.map((choice) => choice.name),
+      message: renderer.colors.default(message),
+      styles: promptStyles({
+        danger: renderer.colors.red, // This sets the color for the error message
+        primary: renderer.colors.red, // This sets the primary color to red
+        submitted: renderer.colors.red, // Assuming 'submitted' is the correct property for the final input
+      }),
+      result(name) {
+        // Return the value corresponding to the selected name
+        return nameToValueMap[name]
+      },
+      onCancel: () => {
+        if (onCancel) {
+          return onCancel()
+        }
+        const err = new Error('Canceled')
+        err.stack = undefined
+        throw err
+      },
+    })
+
+    // Save the last selected value
+    renderer.state.lastToken = answer.select
+    renderer.state.blankAbove = false
+
+    // Restart the spinner if it was stopped
+    renderer.spinner.start()
+
+    return answer.select
+  }
+
+  async checkbox({ message, choices, initial }) {
+    // Stop the spinner to not collide with prompt
+    renderer.spinner.stop()
+
+    const enquirer = new Enquirer()
+
+    const answer = await enquirer.prompt({
+      type: 'multiselect',
+      name: 'multiselect',
+      choices,
+      initial,
+      message: renderer.colors.default(message),
+      styles: promptStyles({
+        danger: renderer.colors.red, // This sets the color for the error message
+        primary: renderer.colors.red, // This sets the primary color to red
+        submitted: renderer.colors.red, // Assuming 'submitted' is the correct property for the final input
+      }),
+      result: (names) => {
+        return choices
+          .filter((choice) => names.includes(choice.name))
+          .map((choice) => choice.value)
+      },
+      onCancel: () => {
+        const err = new Error('Canceled')
+        err.stack = undefined
+        throw err
+      },
+    })
+    // Save the last selected value
+    renderer.state.lastToken = answer.multiselect
+    renderer.state.blankAbove = false
+
+    // Restart the spinner if it was stopped
+    renderer.spinner.start()
+
+    return answer.multiselect
+  }
+
+  /**
+   * Renders a logo to the console.
+   * @param type string | 'serverless-framework'
+   */
+  logo({ postfix = '' } = {}) {
+    // Stop the spinner to not collide with prompt
+    renderer.spinner.stop()
+
+    const content = renderer.style.bold(
+      `${renderer.style.title('Serverless ')}${renderer.colors.red(
+        'ϟ',
+      )}${renderer.style.title(` Framework${postfix ? ` ${postfix}` : ''}`)}`,
+    )
+    writeStdErr({
+      level: 'notice',
+      messageTokens: [content],
+    })
+
+    // Restart the spinner if it was stopped
+    renderer.spinner.start()
+  }
+
+  /**
+   * Renders the support logo to the console.
+   */
+  logoSupport() {
+    // Stop the spinner to not collide with prompt
+    renderer.spinner.stop()
+
+    const content = renderer.style.bold(
+      `${renderer.style.title('Serverless ')}${renderer.colors.red(
+        'ϟ',
+      )}${renderer.style.title(' Support')}`,
+    )
+
+    writeStdErr({
+      level: 'notice',
+      messageTokens: [content],
+    })
+
+    // Restart the spinner if it was stopped
+    renderer.spinner.start()
+  }
+
+  /**
+   * Renders the dev mode logo to the console.
+   */
+  logoDevMode() {
+    // Stop the spinner to not collide with prompt
+    renderer.spinner.stop()
+
+    const content = renderer.style.bold(
+      `${renderer.style.title('Dev ')}${renderer.colors.red(
+        'ϟ',
+      )}${renderer.style.title(' Mode')}`,
+    )
+    writeStdErr({
+      level: 'notice',
+      messageTokens: [content],
+    })
+
+    // Restart the spinner if it was stopped
+    renderer.spinner.start()
+  }
+
+  /**
+   * Renders the Serverless Compose logo to the console.
+   */
+  logoCompose() {
+    let content = renderer.style.bold(
+      `${renderer.style.title('Serverless ')}${renderer.colors.red(
+        'ϟ',
+      )}${renderer.style.title(' Compose')}
+`,
+    )
+
+    const disableNewLine = renderer.isInteractive ? true : false
+
+    writeStdErr({
+      level: 'compose',
+      type: 'compose',
+      messageTokens: [content],
+      prefix: this.prefix,
+      prefixColor: this.prefixColor,
+      disableNewLine,
+    })
+  }
+
+  /**
+   * Backward Compatibility Support
+   * These methods are necessary to support backward compatibility.
+   * DO NOT USE THESE METHODS. Use the methods above instead.
+   */
+  // Alias for notice()
+  logNotice(...args) {
+    this.notice(...args)
+  }
+
+  // Alias for notice()
+  log(...args) {
+    this.notice(...args)
+  }
+
+  // Alias for notice()
+  consoleLog(...args) {
+    this.notice(...args)
+  }
+
+  // Alias for error()
+  logError(...args) {
+    this.error(...args)
+  }
+
+  // Alias for warning()
+  logWarning(...args) {
+    this.warning(...args)
+  }
+
+  // Alias for info()
+  logInfo(...args) {
+    this.info(...args)
+  }
+
+  // Alias for info()
+  verbose(...args) {
+    this.info(...args)
+  }
+
+  // Alias for debug()
+  logDebug(...args) {
+    this.debug(...args)
+  }
+}
+
+/**
+ * This is a cache for plugin-specific loggers.
+ */
+const pluginWritersCache = new Map()
+
+/**
+ * Create a default logger instance with the namespace "s".
+ * This is the default logger instance that should be used
+ * for all logging in the Serverless Framework. All other
+ * loggers will be created as children of this logger.
+ */
+renderer.state.namespaces.set('s', new Logger({ namespace: 's' }))
+const log = renderer.state.namespaces.get('s')
+
+/**
+ * Since progress instances are linked to spinners,
+ * we don't want to have a default progress instance.
+ * Instead, we provide a factory function to create progress instances.
+ */
+const progress = {
+  /**
+   * Find or create a Progress instance.
+   */
+  get(namespace) {
+    return Progress.get(namespace)
+  },
+  /**
+   * Remove all progress states.
+   * Useful for cleaning up progress states after a process is complete,
+   * or an error occurs.
+   */
+  cleanup() {
+    renderer.state.progressTasks.clear()
+    writeProgress()
+  },
+  /**
+   * Whether the spinner keeps a blank line above itself (the default). Without it, the spinner
+   * sits right under the last line, and stays there as lines are printed above it: under a block
+   * of lines that a blank line must not split.
+   */
+  setBlankLineAboveSpinner(on) {
+    renderer.state.spinnerBlankLine = Boolean(on)
+  },
+}
+
+/**
+ * Whether the CLI printed a blank line before anything else, on the same screen as this output:
+ * then the first section needs no blank line of its own above it.
+ */
+const noteStartupBlankLine = (printed) => {
+  markBlankAbove(Boolean(printed))
+}
+
+/**
+ * Make a copy of the style object for external use. `success` colours an outcome that went well
+ * (a 2xx status, say); it is not in renderer.style, so success lines keep their default colour.
+ */
+const style = { ...renderer.style, success: renderer.colors.green }
+
+/**
+ * Get Plugin Writers
+ * This function is used to get the plugin-specific loggers.
+ * It creates a logger instance for the plugin and returns it.
+ * If the logger instance already exists, it returns the cached instance.
+ * @param pluginName string
+ * @returns
+ */
+const getPluginWriters = (pluginName) => {
+  // Validate plugin name
+  if (typeof pluginName !== 'string') {
+    throw new Error('pluginName must be a string')
+  }
+
+  // Normalize and validate pluginName
+  pluginName = pluginName.toLowerCase().replace(/[^a-z0-9-]/g, '-')
+
+  // Check cache
+  if (pluginWritersCache.has(pluginName)) {
+    return pluginWritersCache.get(pluginName)
+  }
+
+  const logger = log.get(`sls:plugin:${pluginName}`)
+
+  const logFunc = function (...args) {
+    return logger.log(...args)
+  }
+
+  Object.getOwnPropertyNames(Logger.prototype).forEach((method) => {
+    if (method !== 'constructor') {
+      logFunc[method] = logger[method].bind(logger)
+    }
+  })
+
+  // Create instances for plugin
+  const pluginWriter = {
+    log: logFunc,
+    // Note that plugins simply get a copy of "main" progress
+    progress: progress.get('main'),
+    style,
+    writeText,
+  }
+
+  // Cache and return
+  pluginWritersCache.set(pluginName, pluginWriter)
+  return pluginWriter
+}
+
+// Exports (adjusted to CommonJS syntax)
+export {
+  Logger,
+  applyAgentSession,
+  noteStartupBlankLine,
+  computeIsInteractive,
+  getColorSettingsForTests,
+  getGlobalRendererSettings,
+  setColorSettingsForTests,
+  setGlobalRendererSettings,
+  log,
+  progress,
+  writeText,
+  style,
+  stringToSafeColor,
+  getPluginWriters,
+  colorizeString,
+}

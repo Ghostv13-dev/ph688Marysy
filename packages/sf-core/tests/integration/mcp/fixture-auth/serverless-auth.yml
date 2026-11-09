@@ -1,0 +1,88 @@
+# Four MCP servers, one per way access to an MCP route can be controlled, plus
+# the uncontrolled one — because "the Framework verifies nothing" is only
+# provable by deploying every enforcement shape it hands to API Gateway and
+# watching the gateway do the work:
+#
+#   cognito       — a Cognito user pool authorizer (the pool is the account's
+#                   predeployed prerequisite), and the one server that also
+#                   publishes OAuth discovery
+#   custom        — a TOKEN Lambda authorizer, written the way a user reaches
+#                   for it first: `authorizer: <function name>`
+#   customRequest — the same secret checked by a REQUEST authorizer, which is
+#                   handed the whole request instead of one header value
+#   open          — no authorizer and no discovery: the plain MCP round trip
+#
+# Every identifier below arrives through the environment, deliberately without
+# defaults: the pool, its scope and its issuer are discovered from SSM at
+# runtime (their ids are not knowable at authoring time) and the shared secret
+# is generated per run, so an unset variable has to fail while resolving the
+# configuration rather than deploy a server nothing can authenticate against.
+service: sfc-mcp-auth
+frameworkVersion: '*'
+
+provider:
+  name: aws
+  # The MCP SDK v2 requires Node.js 20 or newer.
+  runtime: nodejs22.x
+  # An edge-optimized REST endpoint cuts an idle connection at 30s, measured
+  # from invoke rather than from the first byte, which kills a long tool call
+  # whether it streams or not. Regional has no such limit.
+  endpointType: REGIONAL
+
+# Asked for explicitly: the zero-config predicate bundles a Node function only
+# when its entry resolves to TypeScript, so a `.mjs` server takes the classic
+# path unless a `build` block covers it. The emitted format follows the service
+# package.json `type`, which is why this fixture declares `commonjs` while its
+# own sources stay ESM `.mjs`.
+build: esbuild
+
+functions:
+  verifyToken:
+    handler: src/verify-token.handler
+    environment:
+      MCP_TEST_SECRET: ${env:MCP_TEST_SECRET}
+  verifyRequest:
+    handler: src/verify-request.handler
+    environment:
+      MCP_TEST_SECRET: ${env:MCP_TEST_SECRET}
+
+mcp:
+  servers:
+    cognito:
+      server: src/server.mjs
+      timeout: 120
+      authorizer:
+        # A literal pool ARN, so the type is inferred as COGNITO_USER_POOLS.
+        # `name` is set explicitly because the name derived from an ARN is its
+        # last dash-separated segment — for a pool id that is "1_xxxxx", which
+        # cannot start a CloudFormation logical id.
+        name: mcpTestPool
+        arn: ${env:MCP_TEST_COGNITO_POOL_ARN}
+        # Scopes are what make API Gateway validate an ACCESS token: with no
+        # scopes configured it validates an identity token instead, and the
+        # prerequisite pool only mints access tokens (client_credentials).
+        scopes:
+          - ${env:MCP_TEST_COGNITO_SCOPE}
+      oauthDiscovery:
+        issuer: ${env:MCP_TEST_COGNITO_ISSUER}
+    custom:
+      server: src/server.mjs
+      timeout: 120
+      # String form: a bare function name is a TOKEN authorizer.
+      authorizer: verifyToken
+    customRequest:
+      server: src/server.mjs
+      timeout: 120
+      authorizer:
+        name: verifyRequest
+        type: request
+        # 0 disables caching, so the authorizer runs on every request. It also
+        # drops the identity source, which is what lets a request with no
+        # Authorization header reach the function instead of being rejected by
+        # API Gateway before it (see src/verify-request.mjs).
+        resultTtlInSeconds: 0
+    open:
+      server: src/server.mjs
+      # 45 progress steps at 800ms is ~36s, and the silent variant is another
+      # ~36s with nothing written: both are well past any default timeout.
+      timeout: 120
